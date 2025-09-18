@@ -1,4 +1,4 @@
-use std::{sync::Arc, u32};
+use std::{sync::Arc};
 use crate::utils::memdb::MemDB;
 
 use axum::body::Bytes;
@@ -27,7 +27,6 @@ impl AccessCode {
 #[derive(Clone)]
 pub struct FileBlock {
     pub data: Bytes,
-    pub size: u64,
     pub is_final: bool,
     pub filename: String,
     pub start: u64,
@@ -40,10 +39,9 @@ impl FileBlock {
         FILE_BLOCK_DB.clone()
     }
 
-    pub fn new(data: &Bytes, size: u64, is_final: bool, filename: String, start: u64, end: u64, total: u64) -> Self {
+    pub fn new(data: &Bytes, is_final: bool, filename: String, start: u64, end: u64, total: u64) -> Self {
         FileBlock {
             data: data.clone(),
-            size,
             is_final,
             filename,
             start,

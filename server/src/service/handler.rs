@@ -29,8 +29,18 @@ struct FileInfo {
 }
 
 #[instrument]
-pub async fn root() -> impl IntoResponse {
-    match StaticFiles::get("index.html") {
+pub async fn upload() -> impl IntoResponse {
+    match StaticFiles::get("./src/pages/upload/index.html") {
+        Some(content) => {
+            let html = String::from_utf8(content.data.to_vec()).unwrap();
+            Html(html).into_response()
+        }
+        None => (StatusCode::NOT_FOUND, "Page not found").into_response(),
+    }
+}
+
+pub async fn download() -> impl IntoResponse {
+    match StaticFiles::get("./src/pages/download/index.html") {
         Some(content) => {
             let html = String::from_utf8(content.data.to_vec()).unwrap();
             Html(html).into_response()
@@ -144,8 +154,8 @@ pub async fn get_file(
 
     // Get file size and filename
     let file_block_db = FileBlock::get_db();
-    let mut total_size = 0u64;
-    let mut filename = String::new();
+    let total_size: u64 ;
+    let filename: String;
 
     // Calculate file size and get filename
     let mut retry = 0;
@@ -470,7 +480,6 @@ pub async fn upload_file(Path(id): Path<String>, multipart: Multipart) -> impl I
         }
         let file_block = FileBlock::new(
             &data,
-            data.len() as u64,
             is_final > 0,
             filename,
             start,
