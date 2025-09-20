@@ -27,7 +27,6 @@ impl AccessCode {
 #[derive(Clone)]
 pub struct FileBlock {
     pub data: Bytes,
-    pub is_final: bool,
     pub filename: String,
     pub start: u64,
     pub end: u64,
@@ -39,10 +38,9 @@ impl FileBlock {
         FILE_BLOCK_DB.clone()
     }
 
-    pub fn new(data: &Bytes, is_final: bool, filename: String, start: u64, end: u64, total: u64) -> Self {
+    pub fn new(data: &Bytes, filename: String, start: u64, end: u64, total: u64) -> Self {
         FileBlock {
             data: data.clone(),
-            is_final,
             filename,
             start,
             end,
