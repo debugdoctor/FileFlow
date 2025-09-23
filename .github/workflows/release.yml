@@ -14,10 +14,9 @@ jobs:
         run: |
           ./package.sh
       - name: Release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         uses: softprops/action-gh-release@v2
         if: github.ref_type == 'tag'
         with:
+          token: ${{ secrets.GITHUB_TOKEN }}
           files: |
             build/*
