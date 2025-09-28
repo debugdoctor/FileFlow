@@ -9,7 +9,7 @@ axum = { version = "0.8.4", features = ["http2", "multipart"] }
 rust-embed = "8.7.2"
 tokio = { version = "1.47.1", features = ["full"] }
 tracing = "0.1.41"
-tracing-subscriber = "0.3.20"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 tower-http = { version = "0.6.6", features = ["fs", "timeout"] }
 lazy_static = "1.5.0"
 serde_json = "1.0.143"
@@ -20,7 +20,6 @@ async-stream = "0.3.6"
 mime_guess = "2.0.5"
 
 [profile.release]
-opt-level = "z"
+opt-level = 1
 lto = true
 strip = true
-panic = "abort"

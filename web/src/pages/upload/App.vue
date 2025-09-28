@@ -3,18 +3,20 @@ import { onMounted, onUnmounted, ref } from 'vue';
 import { Upload as UploadIcon, FileText, HardDrive } from 'lucide-vue-next';
 import { message, Button, Upload, Progress, Card, Typography, Space, Alert } from 'ant-design-vue';
 import type { UploadProps } from 'ant-design-vue';
+import { uploadFile } from '@/utils/requests';
+import { processUploadWithConcurrencyLimit } from '@/utils/asyncPool';
 
 const CHUNK_SIZE = 1024 * 1024;
 
 const fileList = ref<UploadProps['fileList']>([]);
-const uploading = ref<boolean>(false);
+const uploadState = ref<'idle' | 'pending' | 'processing' | 'finished'>('idle');
 
 const accessId = ref<string | null>(null);
-const uploadStatus = ref('idle');
 const uploadProgress = ref(0);
-const pollingInterval = ref(null);
-const uploadResult = ref(null);
+const maxPollCount = 120; // 最多等待120秒
+const uploadedLength = ref(0);
 const is_online = ref(false);
+const remainingPolls = ref(maxPollCount);
 
 const intervalRef = ref<number | undefined>(undefined)
 
@@ -64,24 +66,27 @@ const getAccessId = async () => {
   }
 
   try {
-    const response = await fetch('/api/get_id');
+    const response = await fetch(`/api/get_id?file_name=${fileList.value[0].name}&file_size=${fileList.value[0].size}`);
     const body = await response.json();
     accessId.value = body.data.id;
     message.success('AccessId 获取成功，请将链接分享给接收方');
     return accessId.value;
   } catch (error) {
-    uploadStatus.value = 'error';
     message.error('获取 AccessId 失败');
     throw error;
   }
 };
 
-const resetUpload = () => {
+const resetUpload = (by_error: boolean) => {
   // Reset all states after upload completion
-  fileList.value = [];
-  accessId.value = null;
+  remainingPolls.value = 0;
   uploadProgress.value = 0;
-  uploading.value = false;
+  uploadedLength.value = 0;
+  uploadState.value = 'idle';
+  accessId.value = null;
+  if (!by_error) {
+    fileList.value = [];
+  }
 };
 
 const handleUpload = async () => {
@@ -94,113 +99,98 @@ const handleUpload = async () => {
     }
   }
 
-  uploading.value = true;
+  uploadState.value = 'pending';
   uploadProgress.value = 0;
-  
+
   message.info('正在等待接收方连接...');
-  
+  remainingPolls.value = maxPollCount;
+
   try {
     // Polling to check if the access code is in use
     let isUsing = false;
-    while (!isUsing) {
+    let pollCount = 0;
+
+    while (!isUsing && pollCount < maxPollCount) {
       const statusResponse = await fetch(`/api/${accessId.value}/status`);
       const statusData = await statusResponse.json();
-      
+
       // Check if is_using is true
-      if (statusData.success && statusData.data.is_using) {
+      if (statusData.success && statusData.data && statusData.data.is_using) {
         isUsing = true;
+        uploadState.value = 'processing';
         message.success('接收方已连接，开始上传文件...');
       } else {
         // Wait for 1 second before checking again
         await new Promise(resolve => setTimeout(resolve, 1000));
+        pollCount++;
+        remainingPolls.value = maxPollCount - pollCount;
+        uploadState.value = 'pending';
       }
+    }
+
+    if (!isUsing) {
+      message.error('等待接收方连接超时');
+      resetUpload(true);
+      return;
     }
 
     for (const file of fileList.value || []) {
       // Access the native File object from the Ant Design Vue file object
       const nativeFile: File = (file as any).originFileObj ? (file as any).originFileObj : file;
-      
+
       const fileSize = file.size || 0;
-      
+
       // Calculate number of chunks
       const chunks = Math.ceil(fileSize / CHUNK_SIZE);
-      
+
       message.info(`开始上传文件: ${file.name} (${formatBytes(fileSize)})`);
-      
-      // Upload each chunk
+
+      // Create an array to hold all chunk upload promises
+      const uploadPromises: Array<() => Promise<any>> = [];
+
+      // Create all chunk upload functions
       for (let i = 0; i < chunks; i++) {
         const start = i * CHUNK_SIZE;
         const end = Math.min(start + CHUNK_SIZE, fileSize);
-        
+        const chunkIndex = i; // 保存当前索引的快照
+
         // Slice the file
         const chunk = nativeFile.slice(start, end);
-        
+
         // Prepare form data
         const formData = new FormData();
         formData.append('info', JSON.stringify({
           filename: file.name,
           start: start,
-          end: end - 1, // end should be the index of the last byte (inclusive)
+          end: end - 1,
           total: fileSize,
         } as UploadInfo));
         formData.append('file', chunk);
-        
-        // Upload the file block with timeout mechanism
-        let retries = 0;
-        const maxRetries = 3;
-        
-        while (retries <= maxRetries) {
-          try {
-            // Create a timeout promise
-            const timeoutPromise = new Promise((_, reject) => {
-              setTimeout(() => reject(new Error('Request timeout')), 18000);
-            });
-            
-            // Create the fetch promise
-            const fetchPromise = fetch(`/api/${accessId.value}/upload`, {
-              method: 'post',
-              body: formData,
-            });
-            
-            // Race the fetch promise against the timeout
-            const response = await Promise.race([fetchPromise, timeoutPromise]) as Response;
-            const body = await response.json();
-            if (body.code !== 200) {
-              throw new Error(`Upload failed for chunk ${i + 1} with status ${response.status}`);
-            }
-            
-            // If successful, break out of retry loop
-            break;
-          } catch (error: unknown) {
-            retries++;
-            if (retries > maxRetries) {
-              message.error("Upload failed. Please try again.");
-              throw new Error(`Upload failed for chunk ${i + 1}: ${(error as Error).message}`);
-            }
-            // Wait a bit before retrying
-            await new Promise(resolve => setTimeout(resolve, 1000));
-          }
-        }
-        
-        // Update progress
-        uploadProgress.value = Math.round(((end) / Math.max(fileSize, 1)) * 100);
+
+        // Create a function that returns a promise for this chunk upload
+        uploadPromises.push(() => uploadFile(formData, accessId.value, chunkIndex, chunk.size));
       }
+
+      // Process uploads with a concurrency limit of 4
+      await processUploadWithConcurrencyLimit(uploadPromises, 4, (seq_len) => {
+        uploadedLength.value += seq_len;
+        uploadProgress.value = Math.round((uploadedLength.value / fileSize) * 100);
+      });
     }
-    
-    fileList.value = [];
-    uploading.value = false;
-    uploadProgress.value = 100;
+
+    uploadState.value = 'finished';
     message.success('文件上传成功！');
-    
+
     // Reset everything after a short delay to allow user to see the success message
     setTimeout(() => {
-      resetUpload();
+      resetUpload(false);
     }, 1000);
   } catch (error) {
-    uploading.value = false;
+    resetUpload(true);
     message.error("上传失败: " + (error as Error).message);
   }
 };
+
 
 const sayHello = () => {
   fetch('/api/hello')
@@ -239,32 +229,26 @@ onUnmounted(() => {
           <Title :level="3" style="margin-bottom: 0;">文件上传</Title>
           <Text type="secondary">通过 FileFlow 快速安全地分享文件</Text>
         </div>
-        
-        <Alert 
-          type="info" 
-          show-icon 
-          message="服务状态" 
-          :description="is_online ? '已连接到服务器，可以正常上传文件' : '无法连接到服务器，请检查网络连接'"
-          :class="is_online ? 'status-online' : 'status-offline'"
-        />
-        
+
+        <Alert type="info" show-icon message="服务状态" :description="is_online ? '已连接到服务器，可以正常上传文件' : '无法连接到服务器，请检查网络连接'"
+          :class="is_online ? 'status-online' : 'status-offline'" />
+
+        <div v-if="uploadState === 'pending'" class="wait-time-container">
+          <Text type="warning">等待接收方连接中... 剩余等待时间: {{ remainingPolls }} 秒</Text>
+        </div>
+
         <div class="file-upload-area">
-          <Upload 
-            :file-list="fileList" 
-            :before-upload="beforeUpload" 
-            @remove="handleRemove"
-            draggable
-            :disabled="uploading"
-          >
+          <Upload :file-list="fileList" :before-upload="beforeUpload" @remove="handleRemove" draggable
+            :disabled="uploadState !== 'idle'">
             <template #itemRender="{ file, actions }">
               <Space>
               </Space>
             </template>
-            <Button icon="upload" size="large" :disabled="uploading">
+            <Button  :disabled="uploadState !== 'idle'">
               选择要上传的文件
             </Button>
           </Upload>
-          
+
           <div v-if="fileList && fileList.length > 0" class="file-info">
             <FileText class="file-icon" />
             <div class="file-details">
@@ -273,7 +257,7 @@ onUnmounted(() => {
             </div>
           </div>
         </div>
-        
+
         <div class="access-id-section">
           <div v-if="accessId" class="access-id-display">
             <Text strong>分享链接:</Text>
@@ -283,26 +267,20 @@ onUnmounted(() => {
             <Text type="secondary">请将此链接发送给文件接收方</Text>
           </div>
         </div>
-        
-        <Button 
-          type="primary" 
-          size="large"
-          :disabled="!fileList || fileList.length === 0 || uploading"
-          :loading="uploading" 
-          @click="handleUpload" 
-          class="upload-button"
-        >
+
+        <Button type="primary" size="large" :disabled="!fileList || fileList.length === 0 || uploadState !== 'idle'"
+          :loading="uploadState === 'pending' || uploadState === 'processing'" @click="handleUpload" class="upload-button">
           <template #icon>
             <HardDrive />
           </template>
-          {{ uploading ? '上传中...' : '获取链接并上传' }}
+          {{ uploadState === 'processing' ? '上传中...' : uploadState === 'pending' ? '等待对方接收' :  '获取链接并上传' }}
         </Button>
-        
-        <div v-if="uploading" class="progress-container">
+
+        <div v-if="uploadState === 'processing'" class="progress-container">
           <Progress :percent="uploadProgress" size="small" />
           <Text type="secondary">{{ uploadProgress }}% 已上传</Text>
         </div>
-        
+
         <div class="instructions">
           <Title :level="5">使用说明:</Title>
           <ul>

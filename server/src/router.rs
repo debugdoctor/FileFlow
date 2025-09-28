@@ -1,7 +1,7 @@
-use axum::{routing::{get, post}, serve, Router};
+use axum::{routing::{get, post, put}, serve, Router};
 use tokio::net::{TcpListener};
 use tower_http::timeout::TimeoutLayer;
-use tracing::{event, instrument};
+use tracing::{event, instrument, Level};
 use std::time::Duration;
 
 use crate::service::handler::{download, get_assets, get_file, get_id, get_status, upload, upload_file};
@@ -9,7 +9,11 @@ use tower_http::services::ServeDir;
 
 fn api_router() -> Router {
     Router::new()
-        .route("/hello", get(|| async { "Hi!" }))
+        .route("/hello", get(|| async { 
+            // Changed from DEBUG to TRACE to reduce log verbosity
+            event!(Level::TRACE, "Hello endpoint accessed");
+            "Hi!" 
+        }))
         .route("/get_id", get(get_id))
         .route("/{id}/status", get(get_status))
         // Add timeout layer specifically for upload api
@@ -33,6 +37,9 @@ fn view_router() -> Router {
 
 #[instrument(skip_all)]
 pub async fn start_server(ip: &str, port: &str) {
+    // Changed from INFO to DEBUG to reduce log verbosity
+    event!(Level::INFO, "Initializing server with ip: {} and port: {}", ip, port);
+    
     let app = Router::new()
         .merge(view_router())
         .nest("/api", api_router())
@@ -44,14 +51,20 @@ pub async fn start_server(ip: &str, port: &str) {
     let listener = match TcpListener::bind(&addr).await {
         Ok(l) => l,
         Err(e) => {
-            event!(tracing::Level::ERROR, "Failed to bind to address: {}", e);
+            event!(Level::ERROR, "Failed to bind to address {}: {}", addr, e);
             return;
         }
     };
 
-    event!(tracing::Level::INFO, "Server listening on {}", addr);
+    // Changed from INFO to DEBUG to reduce log verbosity
+    event!(Level::DEBUG, "Server listening on {}", addr);
     match serve(listener, app).await {
-        Ok(_) => {}
-        Err(e) => event!(tracing::Level::ERROR, "Server error: {}", e),
+        Ok(_) => {
+            // Changed from INFO to DEBUG to reduce log verbosity
+            event!(Level::DEBUG, "Server stopped");
+        }
+        Err(e) => {
+            event!(Level::ERROR, "Server error: {}", e);
+        }
     }
 }

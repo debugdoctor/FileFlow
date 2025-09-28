@@ -1,25 +1,34 @@
 use std::{sync::Arc};
-use crate::utils::memdb::MemDB;
+use super::memdb::MemDB;
 
 use axum::body::Bytes;
 use lazy_static::lazy_static;
 
 #[derive(Clone)]
-pub struct AccessCode {
+pub struct MetaInfo {
     pub is_using: bool,
     pub used_by: String, // a random id gen by client
+    pub block_size: u32,
+    pub file_name: String,
+    pub file_size: u64,
 }
 
-impl AccessCode {
+impl MetaInfo {
 
-    pub fn get_db() -> Arc<MemDB<AccessCode>> {
-        ACCESS_CODE_DB.clone()
+    pub fn get_db() -> Arc<MemDB<MetaInfo>> {
+        META_INFO_DB.clone()
     }
 
-    pub fn new() -> Self {
-        AccessCode {
+    pub fn new(
+        file_name: String,
+        file_size: u64,
+    ) -> Self {
+        MetaInfo {
             is_using: false,
             used_by: "".to_string(),
+            block_size: 1024 * 1024,
+            file_name: file_name,
+            file_size: file_size,
         }
     }
 }
@@ -51,7 +60,7 @@ impl FileBlock {
 }
 
 lazy_static!{
-    pub static ref ACCESS_CODE_DB: Arc<MemDB<AccessCode>> = Arc::new(MemDB::new());
+    pub static ref META_INFO_DB: Arc<MemDB<MetaInfo>> = Arc::new(MemDB::new());
 }
 
 lazy_static!{

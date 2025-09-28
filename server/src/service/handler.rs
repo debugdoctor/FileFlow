@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::{
-    db::{AccessCode, FileBlock},
+    dao::db::{MetaInfo, FileBlock},
     service::static_files::StaticFiles,
     utils::nanoid,
 };
@@ -11,10 +11,10 @@ use axum::{
 use mime_guess;
 use serde::Deserialize;
 use serde_json::json;
-use tracing::{instrument};
+use tracing::{event, instrument, Level};
 
 const MAX_BLOCK_SIZE: u64 = 1024 * 1024; // 1MB
-const MAX_BLOCKS_PER_FILE: usize = 4;
+const MAX_BLOCKS_PER_FILE: usize = 8;
 const MAX_RETRIES: u32 = 5;
 const RETRY_INTERVAL: u64 = 250; // milliseconds
 
@@ -34,7 +34,10 @@ pub async fn upload() -> impl IntoResponse {
             let html = String::from_utf8(content.data.to_vec()).unwrap();
             Html(html).into_response()
         }
-        None => (StatusCode::NOT_FOUND, "Page not found").into_response(),
+        None => {
+            event!(Level::ERROR, "Upload page not found");
+            (StatusCode::NOT_FOUND, "Page not found").into_response()
+        },
     }
 }
 
@@ -44,22 +47,36 @@ pub async fn download() -> impl IntoResponse {
             let html = String::from_utf8(content.data.to_vec()).unwrap();
             Html(html).into_response()
         }
-        None => (StatusCode::NOT_FOUND, "Page not found").into_response(),
+        None => {
+            event!(Level::ERROR, "Download page not found");
+            (StatusCode::NOT_FOUND, "Page not found").into_response()
+        },
     }
 }
 
-pub async fn get_id() -> impl IntoResponse {
+pub async fn get_id(
+    Query(query): Query<HashMap<String, String>>
+) -> impl IntoResponse {
     let id = nanoid::generate();
 
-    let access_code = AccessCode::new();
+    let file_name = query.get("file_name").unwrap_or(&String::new()).to_string();
+    let file_size = query.get("file_size").unwrap_or(&String::from("0")).parse::<u64>().unwrap();
 
-    match AccessCode::get_db()
-        .insert(&id, access_code, 60 * 60 * 24)
+    // Changed from INFO to DEBUG to reduce log verbosity
+    event!(Level::DEBUG, "Generating new ID for file '{}' with size {}", file_name, file_size);
+
+    let meta_info = MetaInfo::new(file_name, file_size);
+
+    match MetaInfo::get_db()
+        .insert(&id, meta_info, 60 * 60 * 24)
         .await
     {
-        Ok(_) => {}
+        Ok(_) => {
+            // Changed from INFO to DEBUG to reduce log verbosity
+            event!(Level::DEBUG, "Successfully generated ID: {}", id);
+        },
         Err(e) => {
-            tracing::error!("{}", e);
+            event!(Level::ERROR, "Failed to insert meta info into DB: {}", e);
             return Json(json!({
                 "code": 500,
                 "success": false,
@@ -80,21 +97,33 @@ pub async fn get_id() -> impl IntoResponse {
 }
 
 pub async fn get_status(Path(id): Path<String>) -> impl IntoResponse {
-    let access_code = AccessCode::get_db().get(&id).await;
-    match access_code {
-        Some(access_code) => Json(json!({
-            "code": 200,
-            "success": true,
-            "data": {
-                "is_using": access_code.value.is_using,
-            }
+    // Changed from DEBUG to TRACE to reduce log verbosity
+    event!(Level::TRACE, "Checking status for ID: {}", id);
+    
+    let meta_info = MetaInfo::get_db().get(&id).await;
+    match meta_info {
+        Some(meta_info) => {
+            // Changed from DEBUG to TRACE to reduce log verbosity
+            event!(Level::TRACE, "Status checked for ID: {}", id);
+            Json(json!({
+                "code": 200,
+                "success": true,
+                "data": {
+                    "file_name": meta_info.value.file_name,
+                    "file_size": meta_info.value.file_size,
+                    "is_using": meta_info.value.is_using,
+                }
 
-        })),
-        None => Json(json!({
-            "code": 404,
-            "success": false,
-            "message": "Not Found"
-        })),
+            }))
+        },
+        None => {
+            event!(Level::WARN, "Status check failed - ID not found: {}", id);
+            Json(json!({
+                "code": 404,
+                "success": false,
+                "message": "Not Found"
+            }))
+        },
     }
 }
 
@@ -106,6 +135,7 @@ pub async fn get_file(
     let receive_id = match query.get("rid") {
         Some(receive_id) => receive_id.to_string(),
         None => {
+            event!(Level::WARN, "Missing Parameter: rid");
             return Ok((
             StatusCode::BAD_REQUEST,
             Json(json!({
@@ -120,6 +150,7 @@ pub async fn get_file(
     let start = match query.get("start") {
         Some(start) => start.parse::<u64>().unwrap(),
         None => {
+            event!(Level::WARN, "Missing Parameter: start");
             return Ok((
             StatusCode::BAD_REQUEST,
             Json(json!({
@@ -132,50 +163,73 @@ pub async fn get_file(
     };
 
     if start == 0 {
-        let access_code = match AccessCode::get_db().get(&id).await {
-            Some(mut access_code) => {
-                if access_code.value.is_using {
-                    return Ok((
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({
-                        "code": 400,
-                        "success": false,
-                        "message": "Bad Request"
-                    })))
-                    .into_response());
+        // Changed from INFO to DEBUG to reduce log verbosity
+        event!(Level::DEBUG, "Starting file download for ID: {} by receiver: {}", id, receive_id);
+        // Try to get the metadata and atomically update it in a single operation
+        let mut retries = 0;
+        
+        loop {
+            let meta_info = MetaInfo::get_db().get(&id).await;
+            
+            match meta_info {
+                Some(mut current_meta) => {
+                    // Check if already in use
+                    if current_meta.value.is_using {
+                        event!(Level::WARN, "File already in use for ID: {}", id);
+                        return Ok((
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "code": 400,
+                            "success": false,
+                            "message": "Bad Request"
+                        })))
+                        .into_response());
+                    }
+                    
+                    // Atomically update the metadata
+                    current_meta.value.is_using = true;
+                    current_meta.value.used_by = receive_id.clone();
+                    
+                    match MetaInfo::get_db().update(&id, current_meta.value, current_meta.exp).await {
+                        Ok(_) => {
+                            // Successfully updated, continue with download
+                            // Changed from INFO to DEBUG to reduce log verbosity
+                            event!(Level::DEBUG, "Successfully updated metadata for ID: {}", id);
+                            break;
+                        }
+                        Err(_) => {
+                            // Update failed, retry
+                            retries += 1;
+                            if retries >= MAX_RETRIES {
+                                event!(Level::ERROR, "Failed to update metadata after {} retries for ID: {}", MAX_RETRIES, id);
+                                return Ok((
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(json!({
+                                    "code": 500,
+                                    "success": false,
+                                    "message": "Internal Server Error"
+                                })))
+                                .into_response());
+                            }
+                            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                        }
+                    }
                 }
-                access_code.value.is_using = true;
-                access_code.value.used_by = receive_id.clone();
-                access_code
+                None => {
+                    event!(Level::WARN, "Access ID Not Found: {}", id);
+                    return Ok((StatusCode::NOT_FOUND, "Access ID Not Found").into_response());
+                }
             }
-            None => {
-                return Ok((StatusCode::NOT_FOUND, "Access ID Not Found").into_response());
-            }
-        };
-
-        match AccessCode::get_db()
-            .update(&id, access_code.value, access_code.exp)
-            .await
-        {
-            Ok(_) => {}
-            Err(_) => {
-                return Ok((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({
-                    "code": 500,
-                    "success": false,
-                    "message": "Internal Server Error"
-                })))
-                .into_response());
-            }
-        };
-
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        }
+        
+        // Small delay to ensure atomicity
+        tokio::time::sleep(tokio::time::Duration::from_millis(RETRY_INTERVAL)).await;
     }
 
-    match AccessCode::get_db().get(&id).await {
-        Some(access_code) => {
-            if access_code.value.used_by != receive_id {
+    match MetaInfo::get_db().get(&id).await {
+        Some(meta_info) => {
+            if meta_info.value.used_by != receive_id {
+                event!(Level::WARN, "Wrong Receive ID for ID: {}", id);
                 return Ok((
                 StatusCode::BAD_REQUEST,
                 Json(json!({
@@ -186,6 +240,7 @@ pub async fn get_file(
             }
         },
         None => {
+            event!(Level::WARN, "Access ID Not Found during verification: {}", id);
             return Ok((StatusCode::NOT_FOUND, "Access ID Not Found").into_response());
         }
     };
@@ -197,6 +252,7 @@ pub async fn get_file(
         match FileBlock::get_db().get(&format!("{}:{:012}", &id, start)).await {
             Some(file_block) => {
                 if file_block.value.start > start {
+                    event!(Level::WARN, "Wrong start position for ID: {} and start: {}", id.clone(), start);
                     return Ok((
                     StatusCode::BAD_REQUEST,
                     Json(json!({
@@ -206,10 +262,13 @@ pub async fn get_file(
                     })))
                     .into_response());
                 }
+                // Changed from DEBUG to TRACE to reduce log verbosity
+                event!(Level::TRACE, "Retrieved block for ID: {} and start: {}", id.clone(), start);
                 break (file_block.value.filename, file_block.value.data, file_block.value.start, file_block.value.end, file_block.value.total);
             },
             None => {
                 if retries >= MAX_RETRIES {
+                    event!(Level::ERROR, "Block {}:{:012} Not Found after {} retries", &id, start, MAX_RETRIES);
                     return Ok((StatusCode::NOT_FOUND, format!("Block {}:{:012} Not Found", &id, start)).into_response());
                 }
                 retries += 1;
@@ -218,25 +277,32 @@ pub async fn get_file(
         }
     };
 
-    match FileBlock::get_db().remove(&format!("{}:{:012}", &id, start)).await{
-        Some(_) => {},
-        None => {
-            return Ok((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({
-                "code": 500,
-                "success": false,
-                "message": "Missing Block"
-            })))
-            .into_response());
+    // Delete the block in a separate async task to prevent blocking the response
+    // This ensures that even if the deletion fails, the response is still sent
+    let delete_task = async |id, start|{
+        match FileBlock::get_db().remove(&format!("{}:{:012}", &id, start)).await {
+            Some(_) => {
+                // Changed from DEBUG to TRACE to reduce log verbosity
+                event!(Level::TRACE, "Successfully removed block {}:{:012}", &id, start);
+            }
+            None => {
+                // Changed from WARN to TRACE to reduce log verbosity
+                event!(Level::TRACE, "Attempted to remove non-existent block {}:{:012}", &id, start);
+            }
         }
-    }
+    };
+    
+    // Spawn the deletion task but don't wait for it to complete
+    tokio::spawn(delete_task(id.clone(), start));
 
     let headers: [(&str, &str); 3] = [
         ("Content-Name", &block_name),
         ("Content-Type", "application/octet-stream"),
         ("Content-Range", &format!("bytes {}-{}/{}", block_start, block_end, block_total)),
     ];
+    
+    // Changed from DEBUG to TRACE to reduce log verbosity
+    event!(Level::TRACE, "Sending file block for ID: {} range: {}-{}", id, block_start, block_end);
     
     Ok((
         StatusCode::PARTIAL_CONTENT,
@@ -247,10 +313,14 @@ pub async fn get_file(
 
 
 pub async fn upload_file(Path(id): Path<String>, multipart: Multipart) -> impl IntoResponse {
+    // Changed from INFO to DEBUG to reduce log verbosity for large files
+    event!(Level::DEBUG, "Starting file upload for ID: {}", id);
+    
     // Check if receiver had visited this id
-    match AccessCode::get_db().get(&id).await {
-        Some(access_code) => {
-            if !access_code.value.is_using {
+    match MetaInfo::get_db().get(&id).await {
+        Some(meta_info) => {
+            if !meta_info.value.is_using {
+                event!(Level::WARN, "Receiver had not visited this id: {}", id);
                 return (
                 StatusCode::BAD_REQUEST,
                 Json(json!({
@@ -262,6 +332,7 @@ pub async fn upload_file(Path(id): Path<String>, multipart: Multipart) -> impl I
             }
         },
         None => {
+            event!(Level::WARN, "Missing Access ID: {}", id);
             return Json(json!({
                 "code": 404,
                 "success": false,
@@ -283,7 +354,7 @@ pub async fn upload_file(Path(id): Path<String>, multipart: Multipart) -> impl I
     if let Some(field) = match multipart.next_field().await {
         Ok(Some(field)) => Some(field),
         Ok(None) => {
-            tracing::error!("Missing info part");
+            event!(Level::ERROR, "Missing info part");
             return Json(json!({
                 "code": 400,
                 "success": false,
@@ -291,7 +362,8 @@ pub async fn upload_file(Path(id): Path<String>, multipart: Multipart) -> impl I
             }))
             .into_response();
         }
-        Err(_) => {
+        Err(e) => {
+            event!(Level::ERROR, "Failed to process multipart: {}", e);
             return Json(json!({
                 "code": 500,
                 "success": false,
@@ -303,6 +375,7 @@ pub async fn upload_file(Path(id): Path<String>, multipart: Multipart) -> impl I
         let name = match field.name() {
             Some(name) => name.to_string(),
             None => {
+                event!(Level::WARN, "Field name is missing");
                 return Json(json!({
                     "code": 400,
                     "success": false,
@@ -313,6 +386,7 @@ pub async fn upload_file(Path(id): Path<String>, multipart: Multipart) -> impl I
         };
 
         if name != "info" {
+            event!(Level::WARN, "First part must be info");
             return Json(json!({
                 "code": 400,
                 "success": false,
@@ -324,7 +398,7 @@ pub async fn upload_file(Path(id): Path<String>, multipart: Multipart) -> impl I
         let data = match field.bytes().await {
             Ok(data) => data,
             Err(err) => {
-                tracing::error!("Failed to read field bytes: {}", err);
+                event!(Level::ERROR, "Failed to read field bytes: {}", err);
                 return Json(json!({
                     "code": 500,
                     "success": false,
@@ -337,7 +411,7 @@ pub async fn upload_file(Path(id): Path<String>, multipart: Multipart) -> impl I
         let info: FileInfo = match serde_json::from_slice(&data) {
             Ok(info) => info,
             Err(err) => {
-                tracing::error!("Failed to parse info json: {}", err);
+                event!(Level::ERROR, "Failed to parse info json: {}", err);
                 return Json(json!({
                     "code": 400,
                     "success": false,
@@ -351,13 +425,16 @@ pub async fn upload_file(Path(id): Path<String>, multipart: Multipart) -> impl I
         start = info.start;
         end = info.end;
         total = info.total;
+        
+        // Changed from DEBUG to TRACE to reduce log verbosity for large files
+        event!(Level::TRACE, "Processed info part for file '{}' with range {}-{} of total {}", filename, start, end, total);
     }
 
     // Process file part
     if let Some(field) = match multipart.next_field().await {
         Ok(Some(field)) => Some(field),
         Ok(None) => {
-            tracing::error!("Missing file part");
+            event!(Level::ERROR, "Missing file part");
             return Json(json!({
                 "code": 400,
                 "success": false,
@@ -366,7 +443,7 @@ pub async fn upload_file(Path(id): Path<String>, multipart: Multipart) -> impl I
             .into_response();
         }
         Err(err) => {
-            tracing::error!("{}", err);
+            event!(Level::ERROR, "Failed to process multipart: {}", err);
             return Json(json!({
                 "code": 500,
                 "success": false,
@@ -378,7 +455,7 @@ pub async fn upload_file(Path(id): Path<String>, multipart: Multipart) -> impl I
         let name = match field.name() {
             Some(name) => name.to_string(),
             None => {
-                tracing::error!("Field name is missing");
+                event!(Level::WARN, "Field name is missing");
                 return Json(json!({
                     "code": 400,
                     "success": false,
@@ -389,6 +466,7 @@ pub async fn upload_file(Path(id): Path<String>, multipart: Multipart) -> impl I
         };
 
         if name != "file" {
+            event!(Level::WARN, "Second part must be file");
             return Json(json!({
                 "code": 400,
                 "success": false,
@@ -400,7 +478,7 @@ pub async fn upload_file(Path(id): Path<String>, multipart: Multipart) -> impl I
         let data = match field.bytes().await {
             Ok(data) => data,
             Err(err) => {
-                tracing::error!("Failed to read field bytes: {}", err);
+                event!(Level::ERROR, "Failed to read field bytes: {}", err);
                 return Json(json!({
                     "code": 500,
                     "success": false,
@@ -415,7 +493,7 @@ pub async fn upload_file(Path(id): Path<String>, multipart: Multipart) -> impl I
             return Json(json!({
                 "code": 400,
                 "success": false,
-                "message": "Block size exceeds maximum limit of 1024KB"
+                "message": "Block size exceeds maximum limitation"
             }))
             .into_response();
         }
@@ -447,7 +525,7 @@ pub async fn upload_file(Path(id): Path<String>, multipart: Multipart) -> impl I
 
         let file_block = FileBlock::new(
             &data,
-            filename,
+            filename.clone(),
             start,
             end,
             total,
@@ -457,9 +535,12 @@ pub async fn upload_file(Path(id): Path<String>, multipart: Multipart) -> impl I
             .insert(&format!("{}:{:012}", &id, start), file_block, 60)
             .await
         {
-            Ok(_) => {}
+            Ok(_) => {
+                // Changed from INFO to DEBUG to reduce log verbosity for large files
+                event!(Level::DEBUG, "Successfully uploaded block for '{}' range {}-{} of total {} for ID: {}", filename, start, end, total, id);
+            },
             Err(e) => {
-                tracing::error!("{}", e);
+                event!(Level::ERROR, "Failed to insert file block into DB: {} for ID: {}", e, id);
                 return Json(json!({
                     "code": 500,
                     "success": false,
@@ -489,6 +570,9 @@ pub async fn get_assets(Path(file): Path<String>) -> impl IntoResponse {
             )]);
             (headers, Body::from(f.data)).into_response()
         },
-        None => (StatusCode::NOT_FOUND, "File not found").into_response(),
+        None => {
+            event!(Level::WARN, "Asset file not found: {}", file);
+            (StatusCode::NOT_FOUND, "File not found").into_response()
+        },
     }
 }
