@@ -52,45 +52,42 @@ const handleGetFile = async () => {
   }
 
   // Process downloads with a concurrency limit of 4
-  await processDownloadWithConcurrencyLimit(downloadPromises, 4, async (rangeMatch: RegExpMatchArray, response: Response) => {
-      const rangeStart = parseInt(rangeMatch[1]);
+  try {
+    await processDownloadWithConcurrencyLimit(downloadPromises, 4, async (rangeMatch: RegExpMatchArray, response: Response) => {
+        const rangeStart = parseInt(rangeMatch[1]);
 
-    // Get the file data
-    const data = await response.arrayBuffer();
-    const chunk = new Uint8Array(data);
-    fileData.set(rangeStart, chunk);
+      // Get the file data
+      const data = await response.arrayBuffer();
+      const chunk = new Uint8Array(data);
+      fileData.set(rangeStart, chunk);
 
-    // Update progress - 累加当前chunk的大小而不是重新计算所有chunks
-    downloadedBytes += chunk.length;
+      // Update progress - 累加当前chunk的大小而不是重新计算所有chunks
+      downloadedBytes += chunk.length;
 
-    // Only update progress if we have a valid totalSize
-    if (fileSize.value > 0) {
-      downloadProgress.value = Math.round((downloadedBytes / fileSize.value) * 100);
-    }
-  });
+      // Only update progress if we have a valid totalSize
+      if (fileSize.value > 0) {
+        downloadProgress.value = Math.round((downloadedBytes / fileSize.value) * 100);
+      }
+    });
+  } catch (error) {
+    message.error('下载过程中发生错误: ' + (error instanceof Error ? error.message : '未知错误'));
+    isDownloading.value = false;
+    return;
+  }
 
   await new Promise<void>(resolve => { setTimeout(resolve, 500)});
 
   // Combine all chunks and save the file
   if (fileData.size > 0) {
+    try {
     // Combine all Uint8Array chunks into a single Uint8Array
     const combinedData = new Uint8Array(fileSize.value);
     let offset = 0;
     const sortedChunks = Array.from(fileData.entries()).sort((a, b) => a[0] - b[0]);
 
-    // test
-    let sortedIdx = [];
     for (const [start, chunk] of sortedChunks) {
-      sortedIdx.push(start);
-    }
-
-    console.log(sortedIdx);
-
-    for (const [start, chunk] of sortedChunks) {
-        console.log(`Processing chunk start: ${start}, offset: ${offset}`); // Add logging for start and offset
         if(start !== offset){
             message.error(`文件 ${fileName.value} 中有缺失的块，请重新上传`);
-            console.error(`文件 ${fileName.value} 中有缺失的块 ${offset} 但只有 ${start}，请重新上传`);
             return;
         }
         combinedData.set(chunk, offset);
@@ -112,7 +109,34 @@ const handleGetFile = async () => {
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
 
-    message.success('文件下载完成!');
+      message.success('文件下载完成!');
+      
+      // Send download completion signal to server
+      try {
+        const pathParts = window.location.pathname.split('/');
+        const fileId = pathParts[1]; // Assumes URL format is /{id}/file
+        
+        const response = await fetch(`/api/${fileId}/done`, {
+          method: 'PUT',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({})
+        });
+        
+        if (response.ok) {
+          // Download completion signal sent successfully
+        } else {
+          message.warning('无法通知服务器下载完成，但文件已成功下载');
+        }
+      } catch (error) {
+        message.warning('无法通知服务器下载完成，但文件已成功下载');
+      }
+    } catch (error) {
+      message.error('保存文件时发生错误: ' + (error instanceof Error ? error.message : '未知错误'));
+    }
+  } else {
+    message.error('没有下载到任何文件数据');
   }
 
   isDownloading.value = false;

@@ -1,15 +1,18 @@
 <script setup lang="ts">
 import { onMounted, onUnmounted, ref } from 'vue';
-import { Upload as UploadIcon, FileText, HardDrive } from 'lucide-vue-next';
+import { Upload as UploadIcon, FileText, HardDrive, X } from 'lucide-vue-next';
 import { message, Button, Upload, Progress, Card, Typography, Space, Alert } from 'ant-design-vue';
 import type { UploadProps } from 'ant-design-vue';
 import { uploadFile } from '@/utils/requests';
 import { processUploadWithConcurrencyLimit } from '@/utils/asyncPool';
+import JSZip from 'jszip';
 
 const CHUNK_SIZE = 1024 * 1024;
 
 const fileList = ref<UploadProps['fileList']>([]);
 const uploadState = ref<'idle' | 'pending' | 'processing' | 'finished'>('idle');
+const isFolderUpload = ref(false);
+const zipFile = ref<File | null>(null);
 
 const accessId = ref<string | null>(null);
 const uploadProgress = ref(0);
@@ -18,7 +21,8 @@ const uploadedLength = ref(0);
 const is_online = ref(false);
 const remainingPolls = ref(maxPollCount);
 
-const intervalRef = ref<number | undefined>(undefined)
+const intervalRef = ref<ReturnType<typeof setInterval> | undefined>(undefined)
+const uploadRef = ref<any>(null)
 
 const HOST = window.location.origin;
 
@@ -43,30 +47,171 @@ const formatBytes = (bytes: number, decimals = 2) => {
 
 const handleRemove: UploadProps['onRemove'] = file => {
   const index = fileList.value!.indexOf(file);
-  const newFileList = fileList.value!.slice();
-  newFileList.splice(index, 1);
-  fileList.value = newFileList;
+  const newFiles = fileList.value!.slice();
+  newFiles.splice(index, 1);
+  fileList.value = newFiles;
 };
 
-const beforeUpload: UploadProps['beforeUpload'] = file => {
-  // Check if a file is already selected
-  if (fileList.value && fileList.value.length > 0) {
-    message.warning('只能上传一个文件');
-    return false;
+const beforeUpload: UploadProps['beforeUpload'] = (file) => {
+  // Handle both files and directories
+  if (file) {
+    if (!fileList.value) fileList.value = [];
+    fileList.value.push(file);
+
+    // Check if it's a directory upload
+    if ((file as any).webkitRelativePath) {
+      isFolderUpload.value = true;
+    } else {
+      // For multiple files, we'll create a zip
+      if (fileList.value.length > 1) {
+        isFolderUpload.value = true;
+      }
+    }
+  }
+  return false;
+};
+
+const createZipFromFolder = async () => {
+  if (!fileList.value || fileList.value.length === 0) return null;
+
+  const zip = new JSZip();
+  const folderName = getFolderName();
+
+  // Add all files to the zip
+  for (const fileItem of fileList.value) {
+    const originFile = (fileItem as any).originFileObj || fileItem;
+
+    if (originFile && originFile.webkitRelativePath) {
+      // Add file with its relative path to maintain folder structure
+      const relativePath = originFile.webkitRelativePath;
+      zip.file(relativePath, originFile);
+    } else {
+      // For files without relative path (multiple files upload), add them to root
+      zip.file(originFile.name, originFile);
+    }
   }
 
-  fileList.value = [file];
-  return false;
+  try {
+    // Generate the zip file
+    const zipBlob = await zip.generateAsync({ type: 'blob' });
+    const zipFileName = `${folderName}.zip`;
+    return new File([zipBlob], zipFileName, { type: 'application/zip' });
+  } catch (error) {
+    console.error('Error creating zip file:', error);
+    message.error('创建压缩文件失败');
+    return null;
+  }
+};
+
+const generateRandomZipName = () => {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  let result = '';
+  for (let i = 0; i < 16; i++) {
+    result += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return result;
+};
+
+const getFolderName = () => {
+  if (!fileList.value || fileList.value.length === 0) return 'folder';
+
+  const firstFile = fileList.value[0];
+  const originFile = (firstFile as any).originFileObj || firstFile;
+
+  if (originFile && originFile.webkitRelativePath) {
+    // Extract folder name from the first file's relative path
+    const pathParts = originFile.webkitRelativePath.split('/');
+    return pathParts[0] || 'folder';
+  }
+
+  // For multiple files without folder structure, use random name
+  if (fileList.value.length > 1) {
+    return generateRandomZipName();
+  }
+
+  // For single file, use the filename without extension
+  const fileName = originFile.name || 'file';
+  const lastDotIndex = fileName.lastIndexOf('.');
+  return lastDotIndex > 0 ? fileName.substring(0, lastDotIndex) : fileName;
+};
+
+const handleChange: UploadProps['onChange'] = ({ fileList: newFileList }) => {
+  // Update the file list when files are added or removed
+  if (newFileList && newFileList.length > 0) {
+    fileList.value = newFileList;
+
+    // Check if any files have webkitRelativePath (indicating folder upload)
+    const hasFolderFiles = newFileList.some(file => (file as any).originFileObj?.webkitRelativePath);
+    const hasMultipleFiles = newFileList.length > 1;
+
+    // Set isFolderUpload to true for folder uploads or multiple files
+    isFolderUpload.value = hasFolderFiles || hasMultipleFiles;
+    
+    // Clear Ant Design's internal file list after processing
+    setTimeout(() => {
+      if (uploadRef.value) {
+        uploadRef.value.fileList = [];
+      }
+    }, 0);
+  }
+};
+
+const handleDrop = (e: DragEvent) => {
+  // Handle drop event for folder structure
+  const items = e.dataTransfer?.items;
+  if (items) {
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      if (item.kind === 'file') {
+        const entry = item.webkitGetAsEntry();
+        if (entry) {
+          processEntry(entry);
+        }
+      }
+    }
+  }
+};
+
+const processEntry = (entry: any) => {
+  if (entry.isFile) {
+    entry.file((file: File) => {
+      // Add file to file list with relative path
+      const fileWithPath = Object.assign(file, {
+        webkitRelativePath: entry.fullPath.replace(/^\//, '')
+      });
+      if (!fileList.value) fileList.value = [];
+      fileList.value.push(fileWithPath as any);
+    });
+  } else if (entry.isDirectory) {
+    const reader = entry.createReader();
+    reader.readEntries((entries: any[]) => {
+      entries.forEach(processEntry);
+    });
+  }
 };
 
 const getAccessId = async () => {
   if (fileList.value === undefined || fileList.value.length === 0) {
-    message.warning('请先选择一个文件');
+    message.warning('请先选择一个文件或文件夹');
     return;
   }
 
+  // Create zip file if it's a folder upload
+  if (isFolderUpload.value) {
+    zipFile.value = await createZipFromFolder();
+    if (!zipFile.value) {
+      message.error('创建压缩文件失败');
+      return;
+    }
+  }
+
   try {
-    const response = await fetch(`/api/get_id?file_name=${fileList.value[0].name}&file_size=${fileList.value[0].size}`);
+    const fileToUpload = isFolderUpload.value ? zipFile.value : fileList.value[0];
+    if (!fileToUpload) {
+      message.error('没有可上传的文件');
+      return;
+    }
+    const response = await fetch(`/api/get_id?file_name=${fileToUpload.name}&file_size=${fileToUpload.size}`);
     const body = await response.json();
     accessId.value = body.data.id;
     message.success('AccessId 获取成功，请将链接分享给接收方');
@@ -84,6 +229,8 @@ const resetUpload = (by_error: boolean) => {
   uploadedLength.value = 0;
   uploadState.value = 'idle';
   accessId.value = null;
+  zipFile.value = null;
+  isFolderUpload.value = false;
   if (!by_error) {
     fileList.value = [];
   }
@@ -134,60 +281,95 @@ const handleUpload = async () => {
       return;
     }
 
-    for (const file of fileList.value || []) {
-      // Access the native File object from the Ant Design Vue file object
-      const nativeFile: File = (file as any).originFileObj ? (file as any).originFileObj : file;
+    // Determine which file to upload (original file or zip file)
+    const fileToUpload = isFolderUpload.value ? zipFile.value : (fileList.value ? fileList.value[0] : null);
 
-      const fileSize = file.size || 0;
-
-      // Calculate number of chunks
-      const chunks = Math.ceil(fileSize / CHUNK_SIZE);
-
-      message.info(`开始上传文件: ${file.name} (${formatBytes(fileSize)})`);
-
-      // Create an array to hold all chunk upload promises
-      const uploadPromises: Array<() => Promise<any>> = [];
-
-      // Create all chunk upload functions
-      for (let i = 0; i < chunks; i++) {
-        const start = i * CHUNK_SIZE;
-        const end = Math.min(start + CHUNK_SIZE, fileSize);
-        const chunkIndex = i; // 保存当前索引的快照
-
-        // Slice the file
-        const chunk = nativeFile.slice(start, end);
-
-        // Prepare form data
-        const formData = new FormData();
-        formData.append('info', JSON.stringify({
-          filename: file.name,
-          start: start,
-          end: end - 1,
-          total: fileSize,
-        } as UploadInfo));
-        formData.append('file', chunk);
-
-        // Create a function that returns a promise for this chunk upload
-        uploadPromises.push(() => uploadFile(formData, accessId.value, chunkIndex, chunk.size));
-      }
-
-      // Process uploads with a concurrency limit of 4
-      await processUploadWithConcurrencyLimit(uploadPromises, 4, (seq_len) => {
-        uploadedLength.value += seq_len;
-        uploadProgress.value = Math.round((uploadedLength.value / fileSize) * 100);
-      });
+    if (!fileToUpload) {
+      message.error('没有可上传的文件');
+      return;
     }
 
-    uploadState.value = 'finished';
-    message.success('文件上传成功！');
+    // Access the native File object from the Ant Design Vue file object
+    const nativeFile: File = isFolderUpload.value ? fileToUpload : ((fileToUpload as any).originFileObj ? (fileToUpload as any).originFileObj : fileToUpload);
 
-    // Reset everything after a short delay to allow user to see the success message
-    setTimeout(() => {
-      resetUpload(false);
-    }, 1000);
+    const fileSize = nativeFile.size || 0;
+    const fileName = nativeFile.name;
+
+    // Calculate number of chunks
+    const chunks = Math.ceil(fileSize / CHUNK_SIZE);
+
+    message.info(`开始上传${isFolderUpload.value ? '压缩' : ''}文件: ${fileName} (${formatBytes(fileSize)})`);
+
+    // Create an array to hold all chunk upload promises
+    const uploadPromises: Array<() => Promise<any>> = [];
+
+    // Create all chunk upload functions
+    for (let i = 0; i < chunks; i++) {
+      const start = i * CHUNK_SIZE;
+      const end = Math.min(start + CHUNK_SIZE, fileSize);
+      const chunkIndex = i; // 保存当前索引的快照
+
+      // Slice the file
+      const chunk = nativeFile.slice(start, end);
+
+      // Prepare form data
+      const formData = new FormData();
+      formData.append('info', JSON.stringify({
+        filename: fileName,
+        start: start,
+        end: end - 1,
+        total: fileSize,
+      } as UploadInfo));
+      formData.append('file', chunk);
+
+      // Create a function that returns a promise for this chunk upload
+      uploadPromises.push(() => uploadFile(formData, accessId.value, chunkIndex, chunk.size));
+    }
+
+    // Process uploads with a concurrency limit of 4
+    await processUploadWithConcurrencyLimit(uploadPromises, 4, (seq_len) => {
+      uploadedLength.value += seq_len;
+      uploadProgress.value = Math.round((uploadedLength.value / fileSize) * 100);
+    });
+
+    uploadState.value = 'finished';
+    message.success('文件上传成功！等待接收方下载完成...');
+
+    let retry: number = 0;
+    // Start polling to check if download is complete
+    const checkDownloadComplete = async () => {
+      if (retry > 20) {
+        message.error('未能得知文件是否被下载完成，确认下载完成则可以关闭窗口！');
+        return;
+      }
+
+      try {
+        const response = await fetch(`/api/${accessId.value}/status`);
+        const data = await response.json();
+
+        if (data.success && data.data && data.data.done) {
+          message.success('接收方已下载完成！');
+          // Reset everything after a short delay
+          setTimeout(() => {
+            resetUpload(false);
+          }, 1500);
+        } else {
+          // Continue polling every second
+          setTimeout(checkDownloadComplete, 1000);
+        }
+      } catch (error) {
+        message.warning('检查下载状态时出错，但将继续尝试');
+        // Continue polling even on error
+        setTimeout(checkDownloadComplete, 1000);
+      }
+    };
+
+    // Start polling after a short delay
+    setTimeout(checkDownloadComplete, 1000);
   } catch (error) {
     resetUpload(true);
-    message.error("上传失败: " + (error as Error).message);
+    const errorMessage = error instanceof Error ? error.message : '未知错误';
+    message.error("上传失败: " + errorMessage);
   }
 };
 
@@ -222,8 +404,8 @@ onUnmounted(() => {
 
 <template>
   <div class="file-upload-container">
-    <Card class="upload-card">
-      <Space direction="vertical" size="large" style="width: 100%">
+    <div class="upload-card">
+      <Space direction="vertical" size="large" style="width: 100%; max-width: 600px;">
         <div class="header">
           <UploadIcon :size="48" :stroke-width="1.5" class="upload-icon" />
           <Title :level="3" style="margin-bottom: 0;">文件上传</Title>
@@ -238,22 +420,27 @@ onUnmounted(() => {
         </div>
 
         <div class="file-upload-area">
-          <Upload :file-list="fileList" :before-upload="beforeUpload" @remove="handleRemove" draggable
-            :disabled="uploadState !== 'idle'">
-            <template #itemRender="{ file, actions }">
-              <Space>
-              </Space>
-            </template>
-            <Button  :disabled="uploadState !== 'idle'">
-              选择要上传的文件
-            </Button>
-          </Upload>
+          <Upload.Dragger ref="uploadRef" :file-list="fileList" :before-upload="beforeUpload" @remove="handleRemove"
+            :disabled="uploadState !== 'idle'" :multiple="true" :directory="true" name="file" :show-upload-list="false"
+            @change="handleChange" @drop="handleDrop">
+            <div class="upload-area-wrapper">
+              <p class="ant-upload-text">点击或拖拽文件到此区域上传</p>
+              <p class="ant-upload-hint">
+                支持单个文件、多个文件或文件夹上传。请勿上传敏感数据。
+              </p>
+            </div>
+          </Upload.Dragger>
 
           <div v-if="fileList && fileList.length > 0" class="file-info">
-            <FileText class="file-icon" />
-            <div class="file-details">
-              <Text strong>{{ fileList[0].name }}</Text>
-              <Text type="secondary">{{ fileList[0].size ? formatBytes(fileList[0].size) : '未知大小' }}</Text>
+            <div v-for="file in fileList" class="file-item">
+              <FileText class="file-icon" />
+              <div class="file-details">
+                <Text strong>{{ file.name }}</Text>
+                <Text type="secondary">{{ file.size ? formatBytes(file.size) : '未知大小' }}</Text>
+              </div>
+              <Button type="text" size="small" @click="handleRemove(file)" class="remove-button">
+                <X :size="16" />
+              </Button>
             </div>
           </div>
         </div>
@@ -269,11 +456,12 @@ onUnmounted(() => {
         </div>
 
         <Button type="primary" size="large" :disabled="!fileList || fileList.length === 0 || uploadState !== 'idle'"
-          :loading="uploadState === 'pending' || uploadState === 'processing'" @click="handleUpload" class="upload-button">
+          :loading="uploadState === 'pending' || uploadState === 'processing'" @click="handleUpload"
+          class="upload-button">
           <template #icon>
             <HardDrive />
           </template>
-          {{ uploadState === 'processing' ? '上传中...' : uploadState === 'pending' ? '等待对方接收' :  '获取链接并上传' }}
+          {{ uploadState === 'processing' ? '上传中...' : uploadState === 'pending' ? '等待对方接收' : '获取链接并上传' }}
         </Button>
 
         <div v-if="uploadState === 'processing'" class="progress-container">
@@ -284,7 +472,9 @@ onUnmounted(() => {
         <div class="instructions">
           <Title :level="5">使用说明:</Title>
           <ul>
-            <li>点击"选择要上传的文件"选择一个文件</li>
+            <li>点击上传区域或拖拽文件/文件夹到此区域</li>
+            <li>支持单个文件、多个文件或整个文件夹上传</li>
+            <li>多个文件或文件夹将自动打包成压缩文件</li>
             <li>点击"获取链接并上传"按钮获取分享链接并开始上传</li>
             <li>将链接发送给文件接收方</li>
             <li>等待接收方访问链接后，文件将自动开始上传</li>
@@ -292,7 +482,7 @@ onUnmounted(() => {
           </ul>
         </div>
       </Space>
-    </Card>
+    </div>
   </div>
 </template>
 
@@ -307,9 +497,13 @@ onUnmounted(() => {
 }
 
 .upload-card {
+  display: flex;
+  justify-content: center;
+  padding: 24px;
   width: 100%;
-  max-width: 500px;
+  max-width: 800px;
   border-radius: 12px;
+  background: #ffffff;
   box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
 }
 
@@ -335,13 +529,34 @@ onUnmounted(() => {
   width: 100%;
 }
 
+.upload-area-wrapper {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  height: 256px;
+}
+
 .file-info {
   display: flex;
-  align-items: center;
+  flex-direction: column;
+  justify-content: flex-start;
+  align-items: flex-start;
+  background-color: #e6f4ff;
   padding: 16px;
-  background-color: #f0f8ff;
-  border-radius: 8px;
   margin-top: 16px;
+  gap: 16px;
+  max-height: 512px;
+  overflow-y: auto;
+}
+
+.file-item {
+  width: 100%;
+  padding: 8px;
+  display: inline-flex;
+  align-items: center;
+  background-color: #ffffff;
+  border-radius: 8px;
+  position: relative;
 }
 
 .file-icon {
@@ -351,6 +566,19 @@ onUnmounted(() => {
 
 .file-details {
   flex: 1;
+}
+
+.remove-button {
+  display: flex;
+  align-items: center;
+  color: #ff4d4f;
+  opacity: 0.7;
+  transition: opacity 0.2s;
+}
+
+.remove-button:hover {
+  opacity: 1;
+  background-color: #fff2f0;
 }
 
 .file-details :deep(.ant-typography) {
@@ -416,5 +644,22 @@ onUnmounted(() => {
 
 :deep(.ant-progress-bg) {
   border-radius: 10px;
+}
+
+.ant-upload-drag-icon {
+  color: #1890ff;
+  margin-bottom: 16px;
+}
+
+.ant-upload-text {
+  font-size: 16px;
+  font-weight: 500;
+  color: rgba(0, 0, 0, 0.85);
+  margin-bottom: 8px;
+}
+
+.ant-upload-hint {
+  color: rgba(0, 0, 0, 0.45);
+  font-size: 14px;
 }
 </style>

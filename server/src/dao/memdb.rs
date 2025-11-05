@@ -1,7 +1,7 @@
 use std::{collections::HashMap, sync::Arc, time::Instant};
 use tokio::sync::RwLock;
 use tokio::time::Duration;
-use tracing::{event, instrument, Level};
+use tracing::{event, Level};
 
 pub struct MemDB<T> {
     pub store: Arc<RwLock<HashMap<String, CacheEntry<T>>>>,

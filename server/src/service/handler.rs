@@ -13,12 +13,16 @@ use serde::Deserialize;
 use serde_json::json;
 use tracing::{event, instrument, Level};
 
-const MAX_BLOCK_SIZE: u64 = 1024 * 1024; // 1MB
-const MAX_BLOCKS_PER_FILE: usize = 8;
+/// Maximum size of each file block in bytes (1MB)
+const MAX_BLOCK_SIZE: u64 = 1024 * 1024;
+/// Maximum number of blocks allowed per file (increased to support larger zip files)
+const MAX_BLOCKS_PER_FILE: usize = 16;
+/// Maximum number of retry attempts for database operations
 const MAX_RETRIES: u32 = 5;
-const RETRY_INTERVAL: u64 = 250; // milliseconds
+/// Interval between retry attempts in milliseconds
+const RETRY_INTERVAL: u64 = 250;
 
-// dto
+/// Data transfer object for file information
 #[derive(Debug, Deserialize)]
 struct FileInfo {
     pub filename: String,
@@ -27,6 +31,8 @@ struct FileInfo {
     pub total: u64,
 }
 
+/// Handler for serving the upload page
+/// Returns the upload HTML page or 404 if not found
 #[instrument]
 pub async fn upload() -> impl IntoResponse {
     match StaticFiles::get("upload/index.html") {
@@ -41,6 +47,8 @@ pub async fn upload() -> impl IntoResponse {
     }
 }
 
+/// Handler for serving the download page
+/// Returns the download HTML page or 404 if not found
 pub async fn download() -> impl IntoResponse {
     match StaticFiles::get("download/index.html") {
         Some(content) => {
@@ -54,6 +62,10 @@ pub async fn download() -> impl IntoResponse {
     }
 }
 
+/// Handler for generating a unique file ID
+/// Accepts file name and size as query parameters
+/// Returns a unique ID that can be used for file transfer
+#[instrument]
 pub async fn get_id(
     Query(query): Query<HashMap<String, String>>
 ) -> impl IntoResponse {
@@ -96,6 +108,9 @@ pub async fn get_id(
     .into_response()
 }
 
+/// Handler for checking the status of a file transfer
+/// Returns file metadata and transfer status
+#[instrument]
 pub async fn get_status(Path(id): Path<String>) -> impl IntoResponse {
     // Changed from DEBUG to TRACE to reduce log verbosity
     event!(Level::TRACE, "Checking status for ID: {}", id);
@@ -112,6 +127,7 @@ pub async fn get_status(Path(id): Path<String>) -> impl IntoResponse {
                     "file_name": meta_info.value.file_name,
                     "file_size": meta_info.value.file_size,
                     "is_using": meta_info.value.is_using,
+                    "done": meta_info.value.done,
                 }
 
             }))
@@ -127,23 +143,26 @@ pub async fn get_status(Path(id): Path<String>) -> impl IntoResponse {
     }
 }
 
+/// Handler for downloading file chunks
+/// Supports range requests for chunked file transfer
+/// Includes retry logic and atomic operations for concurrent access
 #[instrument(skip_all)]
 pub async fn get_file(
     Path(id): Path<String>,
     Query(query): Query<HashMap<String, String>>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> impl IntoResponse {
     let receive_id = match query.get("rid") {
         Some(receive_id) => receive_id.to_string(),
         None => {
             event!(Level::WARN, "Missing Parameter: rid");
-            return Ok((
+            return (
             StatusCode::BAD_REQUEST,
             Json(json!({
                 "code": 400,
                 "success": false,
                 "message": "Missing Parameter: rid"
             })))
-            .into_response());
+            .into_response();
         }
     };
 
@@ -151,14 +170,14 @@ pub async fn get_file(
         Some(start) => start.parse::<u64>().unwrap(),
         None => {
             event!(Level::WARN, "Missing Parameter: start");
-            return Ok((
+            return (
             StatusCode::BAD_REQUEST,
             Json(json!({
                 "code": 400,
                 "success": false,
                 "message": "Missing Parameter: start"
             })))
-            .into_response());
+            .into_response();
         }
     };
 
@@ -176,14 +195,14 @@ pub async fn get_file(
                     // Check if already in use
                     if current_meta.value.is_using {
                         event!(Level::WARN, "File already in use for ID: {}", id);
-                        return Ok((
+                        return (
                         StatusCode::BAD_REQUEST,
                         Json(json!({
                             "code": 400,
                             "success": false,
                             "message": "Bad Request"
                         })))
-                        .into_response());
+                        .into_response();
                     }
                     
                     // Atomically update the metadata
@@ -202,14 +221,14 @@ pub async fn get_file(
                             retries += 1;
                             if retries >= MAX_RETRIES {
                                 event!(Level::ERROR, "Failed to update metadata after {} retries for ID: {}", MAX_RETRIES, id);
-                                return Ok((
+                                return (
                                 StatusCode::INTERNAL_SERVER_ERROR,
                                 Json(json!({
                                     "code": 500,
                                     "success": false,
                                     "message": "Internal Server Error"
                                 })))
-                                .into_response());
+                                .into_response();
                             }
                             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                         }
@@ -217,7 +236,7 @@ pub async fn get_file(
                 }
                 None => {
                     event!(Level::WARN, "Access ID Not Found: {}", id);
-                    return Ok((StatusCode::NOT_FOUND, "Access ID Not Found").into_response());
+                    return (StatusCode::NOT_FOUND, "Access ID Not Found").into_response();
                 }
             }
         }
@@ -230,18 +249,18 @@ pub async fn get_file(
         Some(meta_info) => {
             if meta_info.value.used_by != receive_id {
                 event!(Level::WARN, "Wrong Receive ID for ID: {}", id);
-                return Ok((
+                return (
                 StatusCode::BAD_REQUEST,
                 Json(json!({
                     "code": 400,
                     "success": false,
                     "message": "Wrong Receive ID"
-                }))).into_response());
+                }))).into_response();
             }
         },
         None => {
             event!(Level::WARN, "Access ID Not Found during verification: {}", id);
-            return Ok((StatusCode::NOT_FOUND, "Access ID Not Found").into_response());
+            return (StatusCode::NOT_FOUND, "Access ID Not Found").into_response();
         }
     };
 
@@ -253,14 +272,14 @@ pub async fn get_file(
             Some(file_block) => {
                 if file_block.value.start > start {
                     event!(Level::WARN, "Wrong start position for ID: {} and start: {}", id.clone(), start);
-                    return Ok((
+                    return (
                     StatusCode::BAD_REQUEST,
                     Json(json!({
                         "code": 400,
                         "success": false,
                         "message": "Wrong start position"
                     })))
-                    .into_response());
+                    .into_response();
                 }
                 // Changed from DEBUG to TRACE to reduce log verbosity
                 event!(Level::TRACE, "Retrieved block for ID: {} and start: {}", id.clone(), start);
@@ -269,7 +288,7 @@ pub async fn get_file(
             None => {
                 if retries >= MAX_RETRIES {
                     event!(Level::ERROR, "Block {}:{:012} Not Found after {} retries", &id, start, MAX_RETRIES);
-                    return Ok((StatusCode::NOT_FOUND, format!("Block {}:{:012} Not Found", &id, start)).into_response());
+                    return (StatusCode::NOT_FOUND, format!("Block {}:{:012} Not Found", &id, start)).into_response();
                 }
                 retries += 1;
                 tokio::time::sleep(tokio::time::Duration::from_millis(RETRY_INTERVAL)).await;
@@ -304,14 +323,18 @@ pub async fn get_file(
     // Changed from DEBUG to TRACE to reduce log verbosity
     event!(Level::TRACE, "Sending file block for ID: {} range: {}-{}", id, block_start, block_end);
     
-    Ok((
+    (
         StatusCode::PARTIAL_CONTENT,
         AppendHeaders(headers),
         Body::from(block_data)
-    ).into_response())
+    ).into_response()
 }
 
 
+/// Handler for uploading file chunks
+/// Processes multipart form data with file info and chunk data
+/// Includes validation for block size and file limits
+#[instrument]
 pub async fn upload_file(Path(id): Path<String>, multipart: Multipart) -> impl IntoResponse {
     // Changed from INFO to DEBUG to reduce log verbosity for large files
     event!(Level::DEBUG, "Starting file upload for ID: {}", id);
@@ -518,7 +541,7 @@ pub async fn upload_file(Path(id): Path<String>, multipart: Multipart) -> impl I
             return Json(json!({
                   "code": 400,
                   "success": false,
-                  "message": "Maximum number of blocks per file reached (8)"
+                  "message": format!("Maximum number of blocks per file reached ({})", MAX_BLOCKS_PER_FILE)
             }))
             .into_response();
         }
@@ -559,8 +582,48 @@ pub async fn upload_file(Path(id): Path<String>, multipart: Multipart) -> impl I
     .into_response()
 }
 
+/// Handler for marking file download as complete
+/// Updates the metadata to indicate successful download
+#[instrument]
+pub async fn done(Path(id): Path<String>, Json(_payload): Json<serde_json::Value>) -> impl IntoResponse {
+    // Mark download as complete for the given ID
+    match MetaInfo::get_db().get(&id).await {
+        Some(mut meta_info) => {
+            meta_info.value.done = true;
+            match MetaInfo::get_db().update(&id, meta_info.value, meta_info.exp).await {
+                Ok(_) => {
+                    event!(Level::DEBUG, "Download marked as complete for ID: {}", id);
+                    Json(json!({
+                        "code": 200,
+                        "success": true,
+                        "message": "Download completion marked successfully"
+                    }))
+                },
+                Err(e) => {
+                    event!(Level::ERROR, "Failed to update download completion status: {}", e);
+                    Json(json!({
+                        "code": 500,
+                        "success": false,
+                        "message": "Internal Server Error"
+                    }))
+                }
+            }
+        },
+        None => {
+            event!(Level::WARN, "ID not found for download completion: {}", id);
+            Json(json!({
+                "code": 404,
+                "success": false,
+                "message": "Not Found"
+            }))
+        }
+    }
+}
+
+/// Handler for serving static assets
+/// Returns CSS, JS, and other static files with appropriate MIME types
 #[instrument(skip_all)]
-pub async fn get_assets(Path(file): Path<String>) -> impl IntoResponse { 
+pub async fn get_assets(Path(file): Path<String>) -> impl IntoResponse {
     match StaticFiles::get(format!("assets/{}", file).as_str()) {
         Some(f) => {
             let mime = mime_guess::from_path(&file).first_or_octet_stream();

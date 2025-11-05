@@ -11,6 +11,7 @@ pub struct MetaInfo {
     pub block_size: u32,
     pub file_name: String,
     pub file_size: u64,
+    pub done: bool,
 }
 
 impl MetaInfo {
@@ -29,6 +30,7 @@ impl MetaInfo {
             block_size: 1024 * 1024,
             file_name: file_name,
             file_size: file_size,
+            done: false,
         }
     }
 }

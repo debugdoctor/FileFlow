@@ -4,24 +4,26 @@ use tower_http::timeout::TimeoutLayer;
 use tracing::{event, instrument, Level};
 use std::time::Duration;
 
-use crate::service::handler::{download, get_assets, get_file, get_id, get_status, upload, upload_file};
+use crate::service::handler::{download, get_assets, get_file, get_id, get_status, upload, upload_file, done};
 use tower_http::services::ServeDir;
 
 fn api_router() -> Router {
     Router::new()
-        .route("/hello", get(|| async { 
+        .route("/hello", get(|| async {
             // Changed from DEBUG to TRACE to reduce log verbosity
             event!(Level::TRACE, "Hello endpoint accessed");
-            "Hi!" 
+            "Hi!"
         }))
         .route("/get_id", get(get_id))
         .route("/{id}/status", get(get_status))
         // Add timeout layer specifically for upload api
         .route("/{id}/upload", post(upload_file))
-        .layer(TimeoutLayer::new(Duration::from_secs(20))) 
+        .layer(TimeoutLayer::new(Duration::from_secs(20)))
         // Add timeout layer specifically for download api
         .route("/{id}/file", get(get_file))
-        .layer(TimeoutLayer::new(Duration::from_secs(20))) 
+        .layer(TimeoutLayer::new(Duration::from_secs(20)))
+        .route("/{id}/done", put(done))
+        .layer(TimeoutLayer::new(Duration::from_secs(20)))
 }
 
 fn assets_router() -> Router {

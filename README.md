@@ -7,10 +7,10 @@ Transfer files between two devices via web browser
 
 ```shell
 # Linux
-wget -c https://github.com/debugdoctor/FileFlow/releases/download/v0.1.1/FileFlow-linux-x86_64 -O FileFlow
+wget -c https://github.com/debugdoctor/FileFlow/releases/download/v0.2.0/FileFlow-linux-x86_64 -O FileFlow
 
 # Windows
-wget -c https://github.com/debugdoctor/FileFlow/releases/download/v0.1.1/FileFlow-windows-x86_64.exe -O FileFlow.exe
+wget -c https://github.com/debugdoctor/FileFlow/releases/download/v0.2.0/FileFlow-windows-x86_64.exe -O FileFlow.exe
 ```
 
 ### Usage
