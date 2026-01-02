@@ -8,6 +8,7 @@ use lazy_static::lazy_static;
 pub struct MetaInfo {
     pub is_using: bool,
     pub used_by: String, // a random id gen by client
+    #[allow(dead_code)]
     pub block_size: u32,
     pub file_name: String,
     pub file_size: u64,

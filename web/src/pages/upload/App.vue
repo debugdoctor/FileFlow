@@ -4,6 +4,7 @@ import { Upload as UploadIcon, FileText, HardDrive, X } from 'lucide-vue-next';
 import { message, Button, Upload, Progress, Card, Typography, Space, Alert } from 'ant-design-vue';
 import type { UploadProps } from 'ant-design-vue';
 import { uploadFile } from '@/utils/requests';
+import { sendViaWebRtc } from '@/utils/webrtc';
 import { processUploadWithConcurrencyLimit } from '@/utils/asyncPool';
 import JSZip from 'jszip';
 
@@ -211,7 +212,7 @@ const getAccessId = async () => {
       message.error('没有可上传的文件');
       return;
     }
-    const response = await fetch(`/api/get_id?file_name=${fileToUpload.name}&file_size=${fileToUpload.size}`);
+    const response = await fetch(`/api/fileflow/id?file_name=${fileToUpload.name}&file_size=${fileToUpload.size}`);
     const body = await response.json();
     accessId.value = body.data.id;
     message.success('AccessId 获取成功，请将链接分享给接收方');
@@ -258,7 +259,7 @@ const handleUpload = async () => {
     let pollCount = 0;
 
     while (!isUsing && pollCount < maxPollCount) {
-      const statusResponse = await fetch(`/api/${accessId.value}/status`);
+      const statusResponse = await fetch(`/api/fileflow/${accessId.value}/status`);
       const statusData = await statusResponse.json();
 
       // Check if is_using is true
@@ -295,45 +296,72 @@ const handleUpload = async () => {
     const fileSize = nativeFile.size || 0;
     const fileName = nativeFile.name;
 
-    // Calculate number of chunks
-    const chunks = Math.ceil(fileSize / CHUNK_SIZE);
+    const uploadViaHttp = async () => {
+      // Calculate number of chunks
+      const chunks = Math.ceil(fileSize / CHUNK_SIZE);
 
-    message.info(`开始上传${isFolderUpload.value ? '压缩' : ''}文件: ${fileName} (${formatBytes(fileSize)})`);
+      message.info(`开始上传${isFolderUpload.value ? '压缩' : ''}文件: ${fileName} (${formatBytes(fileSize)})`);
 
-    // Create an array to hold all chunk upload promises
-    const uploadPromises: Array<() => Promise<any>> = [];
+      // Create an array to hold all chunk upload promises
+      const uploadPromises: Array<() => Promise<any>> = [];
 
-    // Create all chunk upload functions
-    for (let i = 0; i < chunks; i++) {
-      const start = i * CHUNK_SIZE;
-      const end = Math.min(start + CHUNK_SIZE, fileSize);
-      const chunkIndex = i; // 保存当前索引的快照
+      // Create all chunk upload functions
+      for (let i = 0; i < chunks; i++) {
+        const start = i * CHUNK_SIZE;
+        const end = Math.min(start + CHUNK_SIZE, fileSize);
+        const chunkIndex = i; // 保存当前索引的快照
 
-      // Slice the file
-      const chunk = nativeFile.slice(start, end);
+        // Slice the file
+        const chunk = nativeFile.slice(start, end);
 
-      // Prepare form data
-      const formData = new FormData();
-      formData.append('info', JSON.stringify({
-        filename: fileName,
-        start: start,
-        end: end - 1,
-        total: fileSize,
-      } as UploadInfo));
-      formData.append('file', chunk);
+        // Prepare form data
+        const formData = new FormData();
+        formData.append('info', JSON.stringify({
+          filename: fileName,
+          start: start,
+          end: end - 1,
+          total: fileSize,
+        } as UploadInfo));
+        formData.append('file', chunk);
 
-      // Create a function that returns a promise for this chunk upload
-      uploadPromises.push(() => uploadFile(formData, accessId.value, chunkIndex, chunk.size));
+        // Create a function that returns a promise for this chunk upload
+        uploadPromises.push(() => uploadFile(formData, accessId.value, chunkIndex, chunk.size));
+      }
+
+      // Process uploads with a concurrency limit of 4
+      await processUploadWithConcurrencyLimit(uploadPromises, 4, (seq_len) => {
+        uploadedLength.value += seq_len;
+        uploadProgress.value = Math.round((uploadedLength.value / fileSize) * 100);
+      });
+    };
+
+    if (!accessId.value) {
+      message.error('AccessId 为空，无法建立连接');
+      resetUpload(true);
+      return;
     }
 
-    // Process uploads with a concurrency limit of 4
-    await processUploadWithConcurrencyLimit(uploadPromises, 4, (seq_len) => {
-      uploadedLength.value += seq_len;
-      uploadProgress.value = Math.round((uploadedLength.value / fileSize) * 100);
+    const p2pResult = await sendViaWebRtc(accessId.value, nativeFile, {
+      onProgress: (percent) => {
+        uploadProgress.value = percent;
+      },
+      onStatus: (status) => {
+        if (status.startsWith('fallback')) {
+          message.warning('P2P 失败，切换到服务器上传');
+        }
+      },
     });
 
-    uploadState.value = 'finished';
-    message.success('文件上传成功！等待接收方下载完成...');
+    if (p2pResult.status === 'success') {
+      uploadState.value = 'finished';
+      message.success('P2P 发送完成！等待接收方下载完成...');
+    } else {
+      uploadedLength.value = 0;
+      uploadProgress.value = 0;
+      await uploadViaHttp();
+      uploadState.value = 'finished';
+      message.success('文件上传成功！等待接收方下载完成...');
+    }
 
     let retry: number = 0;
     // Start polling to check if download is complete
@@ -344,7 +372,7 @@ const handleUpload = async () => {
       }
 
       try {
-        const response = await fetch(`/api/${accessId.value}/status`);
+        const response = await fetch(`/api/fileflow/${accessId.value}/status`);
         const data = await response.json();
 
         if (data.success && data.data && data.data.done) {
@@ -375,7 +403,7 @@ const handleUpload = async () => {
 
 
 const sayHello = () => {
-  fetch('/api/hello')
+  fetch('/api/fileflow/hello')
     .then(response => {
       if (response.status === 200) {
         is_online.value = true;

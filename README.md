@@ -25,3 +25,5 @@ start /b FileFlow.exe > FileFlow.log 2>&1
 ```
 
 Open your browser and visit `http://server_ip:5000/upload` then you can upload files and follow the instructions to download files.
+
+Note: WebRTC P2P is limited to direct LAN connections only.

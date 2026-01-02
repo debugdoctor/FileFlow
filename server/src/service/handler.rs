@@ -192,8 +192,10 @@ pub async fn get_file(
             
             match meta_info {
                 Some(mut current_meta) => {
-                    // Check if already in use
-                    if current_meta.value.is_using {
+                    if current_meta.value.is_using
+                        && !current_meta.value.used_by.is_empty()
+                        && current_meta.value.used_by != receive_id
+                    {
                         event!(Level::WARN, "File already in use for ID: {}", id);
                         return (
                         StatusCode::BAD_REQUEST,
@@ -204,34 +206,38 @@ pub async fn get_file(
                         })))
                         .into_response();
                     }
-                    
-                    // Atomically update the metadata
-                    current_meta.value.is_using = true;
-                    current_meta.value.used_by = receive_id.clone();
-                    
-                    match MetaInfo::get_db().update(&id, current_meta.value, current_meta.exp).await {
-                        Ok(_) => {
-                            // Successfully updated, continue with download
-                            // Changed from INFO to DEBUG to reduce log verbosity
-                            event!(Level::DEBUG, "Successfully updated metadata for ID: {}", id);
-                            break;
-                        }
-                        Err(_) => {
-                            // Update failed, retry
-                            retries += 1;
-                            if retries >= MAX_RETRIES {
-                                event!(Level::ERROR, "Failed to update metadata after {} retries for ID: {}", MAX_RETRIES, id);
-                                return (
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                Json(json!({
-                                    "code": 500,
-                                    "success": false,
-                                    "message": "Internal Server Error"
-                                })))
-                                .into_response();
+
+                    let should_update = !current_meta.value.is_using
+                        || current_meta.value.used_by.is_empty()
+                        || current_meta.value.used_by != receive_id;
+
+                    if should_update {
+                        current_meta.value.is_using = true;
+                        current_meta.value.used_by = receive_id.clone();
+
+                        match MetaInfo::get_db().update(&id, current_meta.value, current_meta.exp).await {
+                            Ok(_) => {
+                                event!(Level::DEBUG, "Successfully updated metadata for ID: {}", id);
+                                break;
                             }
-                            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                            Err(_) => {
+                                retries += 1;
+                                if retries >= MAX_RETRIES {
+                                    event!(Level::ERROR, "Failed to update metadata after {} retries for ID: {}", MAX_RETRIES, id);
+                                    return (
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    Json(json!({
+                                        "code": 500,
+                                        "success": false,
+                                        "message": "Internal Server Error"
+                                    })))
+                                    .into_response();
+                                }
+                                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                            }
                         }
+                    } else {
+                        break;
                     }
                 }
                 None => {

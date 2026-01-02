@@ -5,6 +5,7 @@ use tracing::{event, instrument, Level};
 use std::time::Duration;
 
 use crate::service::handler::{download, get_assets, get_file, get_id, get_status, upload, upload_file, done};
+use crate::service::signaling::{signal_ws, webrtc_config};
 use tower_http::services::ServeDir;
 
 fn api_router() -> Router {
@@ -14,7 +15,9 @@ fn api_router() -> Router {
             event!(Level::TRACE, "Hello endpoint accessed");
             "Hi!"
         }))
-        .route("/get_id", get(get_id))
+        .route("/webrtc-config", get(webrtc_config))
+        .route("/signal/{room_id}", get(signal_ws))
+        .route("/id", get(get_id))
         .route("/{id}/status", get(get_status))
         // Add timeout layer specifically for upload api
         .route("/{id}/upload", post(upload_file))
@@ -44,7 +47,7 @@ pub async fn start_server(ip: &str, port: &str) {
     
     let app = Router::new()
         .merge(view_router())
-        .nest("/api", api_router())
+        .nest("/api/fileflow", api_router())
         .nest("/assets", assets_router())
         // 添加静态文件服务，用于提供web/dist目录中的文件
         .fallback_service(ServeDir::new("../web/dist"));

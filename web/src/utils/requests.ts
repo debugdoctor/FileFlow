@@ -16,7 +16,7 @@ export const uploadFile = async (formData: FormData, accessId: string | null, i:
             });
 
             // Create the fetch promise
-            const fetchPromise = fetch(`/api/${accessId}/upload`, {
+            const fetchPromise = fetch(`/api/fileflow/${accessId}/upload`, {
                 method: 'post',
                 body: formData,
             });
@@ -46,7 +46,7 @@ export const uploadFile = async (formData: FormData, accessId: string | null, i:
 }
 
 export const downloadFile = async (fileId: string, start: number, fileName: Ref<string>): Promise<[RegExpMatchArray, Response]> => {
-    const response = await fetch(`/api/${fileId}/file?rid=${localStorage.getItem("rid")}&start=${start}`);
+    const response = await fetch(`/api/fileflow/${fileId}/file?rid=${localStorage.getItem("rid")}&start=${start}`);
 
     // Get the Content-Range header
     const contentRange = response.headers.get('Content-Range');

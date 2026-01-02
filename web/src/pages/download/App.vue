@@ -5,6 +5,7 @@ import { onMounted } from 'vue';
 import { Download, FileText, HardDrive } from 'lucide-vue-next';
 import { downloadFile } from '@/utils/requests';
 import { processDownloadWithConcurrencyLimit } from '@/utils/asyncPool';
+import { receiveViaWebRtc } from '@/utils/webrtc';
 
 const { Title, Text } = Typography;
 
@@ -26,7 +27,7 @@ const formatBytes = (bytes: number, decimals = 2) => {
 const handleGetFile = async () => {
   isDownloading.value = true;
   downloadProgress.value = 0;
-  
+
   let start = 0;
   let fileData: Map<number, Uint8Array> = new Map();
   let downloadedBytes = 0;
@@ -35,117 +36,158 @@ const handleGetFile = async () => {
   const pathParts = window.location.pathname.split('/');
   const fileId = pathParts[1]; // Assumes URL format is /{id}/file
 
-  // Create an array to hold all chunk download promises
-  const downloadPromises: Array<() => Promise<any>> = [];
+  const downloadViaHttp = async () => {
+    // Create an array to hold all chunk download promises
+    const downloadPromises: Array<() => Promise<any>> = [];
 
-  // Add chunks to download (in 1MB chunks)
-  while (start < fileSize.value) {
-    const chunkEnd = Math.min(start + 1024 * 1024, fileSize.value) - 1;
-    const currentStart = start; // 保存当前start值的快照
+    // Add chunks to download (in 1MB chunks)
+    while (start < fileSize.value) {
+      const chunkEnd = Math.min(start + 1024 * 1024, fileSize.value) - 1;
+      const currentStart = start; // 保存当前start值的快照
 
-    // Create a function that returns a promise for this chunk download
-    // Pass fileId and the byte range start, but not fileName since it's not needed for the request
-    downloadPromises.push(() => downloadFile(fileId, currentStart, fileName));
+      // Create a function that returns a promise for this chunk download
+      // Pass fileId and the byte range start, but not fileName since it's not needed for the request
+      downloadPromises.push(() => downloadFile(fileId, currentStart, fileName));
 
-    if (chunkEnd === fileSize.value - 1) break;
-    start += 1024 * 1024;
-  }
-
-  // Process downloads with a concurrency limit of 4
-  try {
-    await processDownloadWithConcurrencyLimit(downloadPromises, 4, async (rangeMatch: RegExpMatchArray, response: Response) => {
-        const rangeStart = parseInt(rangeMatch[1]);
-
-      // Get the file data
-      const data = await response.arrayBuffer();
-      const chunk = new Uint8Array(data);
-      fileData.set(rangeStart, chunk);
-
-      // Update progress - 累加当前chunk的大小而不是重新计算所有chunks
-      downloadedBytes += chunk.length;
-
-      // Only update progress if we have a valid totalSize
-      if (fileSize.value > 0) {
-        downloadProgress.value = Math.round((downloadedBytes / fileSize.value) * 100);
-      }
-    });
-  } catch (error) {
-    message.error('下载过程中发生错误: ' + (error instanceof Error ? error.message : '未知错误'));
-    isDownloading.value = false;
-    return;
-  }
-
-  await new Promise<void>(resolve => { setTimeout(resolve, 500)});
-
-  // Combine all chunks and save the file
-  if (fileData.size > 0) {
-    try {
-    // Combine all Uint8Array chunks into a single Uint8Array
-    const combinedData = new Uint8Array(fileSize.value);
-    let offset = 0;
-    const sortedChunks = Array.from(fileData.entries()).sort((a, b) => a[0] - b[0]);
-
-    for (const [start, chunk] of sortedChunks) {
-        if(start !== offset){
-            message.error(`文件 ${fileName.value} 中有缺失的块，请重新上传`);
-            return;
-        }
-        combinedData.set(chunk, offset);
-        offset += chunk.length;
+      if (chunkEnd === fileSize.value - 1) break;
+      start += 1024 * 1024;
     }
 
-    // Create a Blob from the combined data
-    const blob = new Blob([combinedData], { type: 'application/octet-stream' });
+    // Process downloads with a concurrency limit of 4
+    try {
+      await processDownloadWithConcurrencyLimit(downloadPromises, 4, async (rangeMatch: RegExpMatchArray, response: Response) => {
+        const rangeStart = parseInt(rangeMatch[1]);
 
-    // Create a download link and trigger the download
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = fileName.value || 'downloaded_file';
-    document.body.appendChild(a);
-    a.click();
+        // Get the file data
+        const data = await response.arrayBuffer();
+        const chunk = new Uint8Array(data);
+        fileData.set(rangeStart, chunk);
 
-    // Clean up
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
+        // Update progress - 累加当前chunk的大小而不是重新计算所有chunks
+        downloadedBytes += chunk.length;
 
-      message.success('文件下载完成!');
-      
-      // Send download completion signal to server
+        // Only update progress if we have a valid totalSize
+        if (fileSize.value > 0) {
+          downloadProgress.value = Math.round((downloadedBytes / fileSize.value) * 100);
+        }
+      });
+    } catch (error) {
+      message.error('下载过程中发生错误: ' + (error instanceof Error ? error.message : '未知错误'));
+      isDownloading.value = false;
+      return;
+    }
+
+    await new Promise<void>(resolve => { setTimeout(resolve, 500)});
+
+    // Combine all chunks and save the file
+    if (fileData.size > 0) {
       try {
-        const pathParts = window.location.pathname.split('/');
-        const fileId = pathParts[1]; // Assumes URL format is /{id}/file
-        
-        const response = await fetch(`/api/${fileId}/done`, {
-          method: 'PUT',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({})
-        });
-        
-        if (response.ok) {
-          // Download completion signal sent successfully
-        } else {
+        // Combine all Uint8Array chunks into a single Uint8Array
+        const combinedData = new Uint8Array(fileSize.value);
+        let offset = 0;
+        const sortedChunks = Array.from(fileData.entries()).sort((a, b) => a[0] - b[0]);
+
+        for (const [start, chunk] of sortedChunks) {
+          if (start !== offset) {
+            message.error(`文件 ${fileName.value} 中有缺失的块，请重新上传`);
+            return;
+          }
+          combinedData.set(chunk, offset);
+          offset += chunk.length;
+        }
+
+        // Create a Blob from the combined data
+        const blob = new Blob([combinedData], { type: 'application/octet-stream' });
+
+        // Create a download link and trigger the download
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = fileName.value || 'downloaded_file';
+        document.body.appendChild(a);
+        a.click();
+
+        // Clean up
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+
+        message.success('文件下载完成!');
+
+        // Send download completion signal to server
+        try {
+          const pathParts = window.location.pathname.split('/');
+          const fileId = pathParts[1]; // Assumes URL format is /{id}/file
+
+          const response = await fetch(`/api/fileflow/${fileId}/done`, {
+            method: 'PUT',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({})
+          });
+
+          if (response.ok) {
+            // Download completion signal sent successfully
+          } else {
+            message.warning('无法通知服务器下载完成，但文件已成功下载');
+          }
+        } catch (error) {
           message.warning('无法通知服务器下载完成，但文件已成功下载');
         }
       } catch (error) {
+        message.error('保存文件时发生错误: ' + (error instanceof Error ? error.message : '未知错误'));
+      }
+    } else {
+      message.error('没有下载到任何文件数据');
+    }
+
+    isDownloading.value = false;
+    isFinished.value = true;
+  };
+
+  const rid = localStorage.getItem("rid") || "";
+  const p2pResult = await receiveViaWebRtc(fileId, rid, {
+    onProgress: (percent) => {
+      downloadProgress.value = percent;
+    },
+    onMetadata: (name, size) => {
+      if (!fileName.value) fileName.value = name;
+      if (!fileSize.value) fileSize.value = size;
+    },
+    onStatus: (status) => {
+      if (status.startsWith('fallback')) {
+        message.warning('P2P 失败，切换到服务器下载');
+      }
+    },
+  });
+
+  if (p2pResult.status === 'success') {
+    try {
+      const response = await fetch(`/api/fileflow/${fileId}/done`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({})
+      });
+      if (!response.ok) {
         message.warning('无法通知服务器下载完成，但文件已成功下载');
       }
-    } catch (error) {
-      message.error('保存文件时发生错误: ' + (error instanceof Error ? error.message : '未知错误'));
+    } catch {
+      message.warning('无法通知服务器下载完成，但文件已成功下载');
     }
-  } else {
-    message.error('没有下载到任何文件数据');
+    isDownloading.value = false;
+    isFinished.value = true;
+    message.success('文件下载完成!');
+    return;
   }
-
-  isDownloading.value = false;
-  isFinished.value = true;
+  await new Promise(resolve => setTimeout(resolve, 1000));
+  await downloadViaHttp();
 }
 
 onMounted(async () => {
   if (localStorage.getItem("rid") == null || localStorage.getItem("rid") == "" || localStorage.getItem("rid") == undefined) {
-    localStorage.setItem("rid", Math.random().toString(36).substring(16));
+    localStorage.setItem("rid", Math.random().toString(36).slice(2, 10));
   }
 
   // Get the file info from status API
@@ -154,7 +196,7 @@ onMounted(async () => {
     const pathParts = window.location.pathname.split('/');
     const fileId = pathParts[1]; // Assumes URL format is /{id}/file
 
-    const response = await fetch(`/api/${fileId}/status`);
+    const response = await fetch(`/api/fileflow/${fileId}/status`);
     const statusData = await response.json();
 
     if (!statusData.success) {
