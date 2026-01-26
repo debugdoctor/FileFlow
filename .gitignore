@@ -57,3 +57,6 @@ coverage
 *.tsbuildinfo
 
 build/
+
+# Local environment files
+.env

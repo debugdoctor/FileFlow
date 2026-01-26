@@ -1,7 +1,8 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const ALPHABET: &str = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-_";
-const DEFAULT_SIZE: usize = 8;
+// Restrict IDs to 5 characters using digits + lowercase letters
+const ALPHABET: &str = "0123456789abcdefghijklmnopqrstuvwxyz";
+const DEFAULT_SIZE: usize = 5;
 
 /// using the default alphabet
 pub fn generate() -> String {
@@ -41,7 +42,7 @@ mod tests {
     #[test]
     fn test_generate() {
         let id = generate();
-        assert_eq!(id.len(), 21);
+        assert_eq!(id.len(), 5);
     }
 
     #[test]

@@ -1,11 +1,9 @@
 <script setup lang="ts">
-import { ref } from 'vue';
+import { ref, onMounted, nextTick } from 'vue';
 import { Button, Progress, message, Card, Typography, Space } from 'ant-design-vue';
-import { onMounted } from 'vue';
 import { Download, FileText, HardDrive } from 'lucide-vue-next';
-import { downloadFile } from '@/utils/requests';
+import { downloadFile, fetchJsonWithRetry, fetchWithRetry } from '@/utils/requests';
 import { processDownloadWithConcurrencyLimit } from '@/utils/asyncPool';
-import { receiveViaWebRtc } from '@/utils/webrtc';
 
 const { Title, Text } = Typography;
 
@@ -14,6 +12,10 @@ const isDownloading = ref(false);
 const isFinished = ref(false);
 const fileName = ref('');
 const fileSize = ref(0); // with units
+const requiresCode = ref(false);
+const codeDigits = ref<string[]>(['', '', '', '', '']);
+const codeInputs = ref<Array<HTMLInputElement | null>>([]);
+const activeFileId = ref<string | null>(null);
 
 const formatBytes = (bytes: number, decimals = 2) => {
   if (bytes === 0) return '0 Bytes';
@@ -24,7 +26,77 @@ const formatBytes = (bytes: number, decimals = 2) => {
   return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
 };
 
+const focusInput = (index: number) => {
+  const el = codeInputs.value[index];
+  if (el) {
+    el.focus();
+    el.select();
+  }
+};
+
+const sanitizeInput = (value: string) => value.toLowerCase().replace(/[^0-9a-z]/g, '');
+
+const trySubmitCode = () => {
+  const code = codeDigits.value.join('');
+  if (code.length === 5) {
+    window.location.href = `/${code}/file`;
+  }
+};
+
+const handleCodeInput = (event: Event, index: number) => {
+  const target = event.target as HTMLInputElement;
+  const sanitized = sanitizeInput(target.value);
+
+  if (!sanitized) {
+    codeDigits.value[index] = '';
+    return;
+  }
+
+  const chars = sanitized.split('');
+  codeDigits.value[index] = chars[0];
+
+  let nextIndex = index + 1;
+  for (let i = 1; i < chars.length && nextIndex < 5; i += 1, nextIndex += 1) {
+    codeDigits.value[nextIndex] = chars[i];
+  }
+
+  if (nextIndex < 5) {
+    focusInput(nextIndex);
+  }
+  trySubmitCode();
+};
+
+const handleCodeKeyDown = (event: KeyboardEvent, index: number) => {
+  if (event.key === 'Backspace' && !codeDigits.value[index] && index > 0) {
+    focusInput(index - 1);
+  }
+};
+
+const handleCodePaste = (event: ClipboardEvent) => {
+  const text = event.clipboardData?.getData('text') ?? '';
+  const sanitized = sanitizeInput(text).slice(0, 5);
+  if (!sanitized) return;
+
+  const chars = sanitized.split('');
+  for (let i = 0; i < 5; i += 1) {
+    codeDigits.value[i] = chars[i] || '';
+  }
+
+  nextTick(() => {
+    if (sanitized.length >= 5) {
+      trySubmitCode();
+    } else {
+      focusInput(sanitized.length);
+    }
+  });
+};
+
 const handleGetFile = async () => {
+  if (!activeFileId.value) {
+    message.warning('请先输入有效的 5 位 ID');
+    return;
+  }
+
   isDownloading.value = true;
   downloadProgress.value = 0;
 
@@ -32,9 +104,7 @@ const handleGetFile = async () => {
   let fileData: Map<number, Uint8Array> = new Map();
   let downloadedBytes = 0;
 
-  // Extract the file ID from the URL
-  const pathParts = window.location.pathname.split('/');
-  const fileId = pathParts[1]; // Assumes URL format is /{id}/file
+  const fileId = activeFileId.value;
 
   const downloadViaHttp = async () => {
     // Create an array to hold all chunk download promises
@@ -115,20 +185,19 @@ const handleGetFile = async () => {
 
         // Send download completion signal to server
         try {
-          const pathParts = window.location.pathname.split('/');
-          const fileId = pathParts[1]; // Assumes URL format is /{id}/file
-
-          const response = await fetch(`/api/fileflow/${fileId}/done`, {
-            method: 'PUT',
-            headers: {
-              'Content-Type': 'application/json',
+          const response = await fetchWithRetry(
+            `/api/fileflow/${fileId}/done`,
+            {
+              method: 'PUT',
+              headers: {
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify({})
             },
-            body: JSON.stringify({})
-          });
+            { timeoutMs: 6000, retries: 2 },
+          );
 
-          if (response.ok) {
-            // Download completion signal sent successfully
-          } else {
+          if (!response.ok) {
             message.warning('无法通知服务器下载完成，但文件已成功下载');
           }
         } catch (error) {
@@ -145,43 +214,6 @@ const handleGetFile = async () => {
     isFinished.value = true;
   };
 
-  const rid = localStorage.getItem("rid") || "";
-  const p2pResult = await receiveViaWebRtc(fileId, rid, {
-    onProgress: (percent) => {
-      downloadProgress.value = percent;
-    },
-    onMetadata: (name, size) => {
-      if (!fileName.value) fileName.value = name;
-      if (!fileSize.value) fileSize.value = size;
-    },
-    onStatus: (status) => {
-      if (status.startsWith('fallback')) {
-        message.warning('P2P 失败，切换到服务器下载');
-      }
-    },
-  });
-
-  if (p2pResult.status === 'success') {
-    try {
-      const response = await fetch(`/api/fileflow/${fileId}/done`, {
-        method: 'PUT',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({})
-      });
-      if (!response.ok) {
-        message.warning('无法通知服务器下载完成，但文件已成功下载');
-      }
-    } catch {
-      message.warning('无法通知服务器下载完成，但文件已成功下载');
-    }
-    isDownloading.value = false;
-    isFinished.value = true;
-    message.success('文件下载完成!');
-    return;
-  }
-  await new Promise(resolve => setTimeout(resolve, 1000));
   await downloadViaHttp();
 }
 
@@ -190,17 +222,26 @@ onMounted(async () => {
     localStorage.setItem("rid", Math.random().toString(36).slice(2, 10));
   }
 
+  const segments = window.location.pathname.split('/').filter(Boolean);
+  if (segments.length === 0 || segments[0].length !== 5) {
+    requiresCode.value = true;
+    await nextTick();
+    focusInput(0);
+    return;
+  }
+
+  activeFileId.value = segments[0];
+
   // Get the file info from status API
   try {
-    // Extract the file ID from the URL
-    const pathParts = window.location.pathname.split('/');
-    const fileId = pathParts[1]; // Assumes URL format is /{id}/file
+    const { data: statusData, response } = await fetchJsonWithRetry<{ success?: boolean; data?: { file_name?: string; file_size?: number; } }>(
+      `/api/fileflow/${activeFileId.value}/status`,
+      { method: 'get' },
+      { timeoutMs: 8000, retries: 2 },
+    );
 
-    const response = await fetch(`/api/fileflow/${fileId}/status`);
-    const statusData = await response.json();
-
-    if (!statusData.success) {
-      message.error('获取文件信息失败: ' + (statusData.message || '未知错误'));
+    if (!response.ok || !statusData?.success || !statusData.data) {
+      message.error('获取文件信息失败: ' + ((statusData as any)?.message || '未知错误'));
       isDownloading.value = false;
       return;
     }
@@ -213,15 +254,42 @@ onMounted(async () => {
   } catch (error: unknown) {
     message.error(`获取文件信息失败: ${(error as Error).message}`);
     isDownloading.value = false;
-    return;
   }
-
 });
 </script>
 
 <template>
   <div class="download-page">
-    <Card class="download-card">
+    <Card v-if="requiresCode" class="code-card">
+      <Space direction="vertical" size="large" style="width: 100%">
+        <div class="header">
+          <Download :size="48" :stroke-width="1.5" class="download-icon" />
+          <Title :level="3" style="margin-bottom: 0;">输入 5 位 ID</Title>
+          <Text type="secondary">输入接收方提供的 5 位代码即可进入下载</Text>
+        </div>
+
+        <div class="code-inputs" @paste.prevent="handleCodePaste">
+          <input
+            v-for="(_, index) in codeDigits"
+            :key="index"
+            :ref="(el) => codeInputs[index] = el as HTMLInputElement | null"
+            type="text"
+            inputmode="text"
+            maxlength="1"
+            class="code-box"
+            v-model="codeDigits[index]"
+            @input="(e) => handleCodeInput(e, index)"
+            @keydown="(e) => handleCodeKeyDown(e, index)"
+          />
+        </div>
+
+        <Button type="primary" size="large" block :disabled="codeDigits.join('').length !== 5" @click="trySubmitCode">
+          进入下载
+        </Button>
+      </Space>
+    </Card>
+
+    <Card v-else class="download-card">
       <Space direction="vertical" size="large" style="width: 100%">
         <div class="header">
           <Download :size="48" :stroke-width="1.5" class="download-icon" />
@@ -272,6 +340,36 @@ onMounted(async () => {
   align-items: center;
   min-height: 100vh;
   background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+}
+
+.code-card {
+  width: 100%;
+  max-width: 520px;
+  border-radius: 12px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.12);
+}
+
+.code-inputs {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 12px;
+}
+
+.code-box {
+  width: 100%;
+  height: 56px;
+  border-radius: 10px;
+  border: 1px solid #d9d9d9;
+  text-align: center;
+  font-size: 24px;
+  font-weight: 600;
+  transition: border-color 0.2s, box-shadow 0.2s;
+}
+
+.code-box:focus {
+  outline: none;
+  border-color: #1890ff;
+  box-shadow: 0 0 0 3px rgba(24, 144, 255, 0.16);
 }
 
 .download-card {

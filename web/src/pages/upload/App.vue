@@ -3,12 +3,12 @@ import { onMounted, onUnmounted, ref } from 'vue';
 import { Upload as UploadIcon, FileText, HardDrive, X } from 'lucide-vue-next';
 import { message, Button, Upload, Progress, Card, Typography, Space, Alert } from 'ant-design-vue';
 import type { UploadProps } from 'ant-design-vue';
-import { uploadFile } from '@/utils/requests';
-import { sendViaWebRtc } from '@/utils/webrtc';
+import { uploadFile, fetchJsonWithRetry, fetchWithRetry } from '@/utils/requests';
 import { processUploadWithConcurrencyLimit } from '@/utils/asyncPool';
 import JSZip from 'jszip';
 
 const CHUNK_SIZE = 1024 * 1024;
+const MAX_TOTAL_SIZE = CHUNK_SIZE * 1024; // keep in sync with server limits (1GB)
 
 const fileList = ref<UploadProps['fileList']>([]);
 const uploadState = ref<'idle' | 'pending' | 'processing' | 'finished'>('idle');
@@ -24,6 +24,7 @@ const remainingPolls = ref(maxPollCount);
 
 const intervalRef = ref<ReturnType<typeof setInterval> | undefined>(undefined)
 const uploadRef = ref<any>(null)
+const folderInputRef = ref<HTMLInputElement | null>(null);
 
 const HOST = window.location.origin;
 
@@ -46,6 +47,55 @@ const formatBytes = (bytes: number, decimals = 2) => {
   return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
 };
 
+const getRelativePath = (file: any) => (file?.originFileObj?.webkitRelativePath || file?.webkitRelativePath || '') as string;
+
+const dedupeFiles = (files: UploadProps['fileList'] = []) => {
+  const seen = new Set<string>();
+  const cleaned: UploadProps['fileList'] = [];
+
+  files.forEach((file) => {
+    const origin = (file as any).originFileObj || file;
+    const relPath = getRelativePath(file);
+    const key = `${relPath}::${origin?.name || file?.name || ''}::${origin?.size || file?.size || 0}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      cleaned.push(file);
+    }
+  });
+
+  return cleaned;
+};
+
+const isFolderLike = (files: UploadProps['fileList'] = []) =>
+  files.some((file) => {
+    const relPath = getRelativePath(file);
+    return relPath && relPath.split('/').filter(Boolean).length > 1;
+  });
+
+const addFileToList = (file: any) => {
+  const merged = [...(fileList.value || []), file];
+  fileList.value = dedupeFiles(merged);
+  const listLen = fileList.value?.length || 0;
+  isFolderUpload.value = listLen > 1 || isFolderLike(fileList.value);
+};
+
+const triggerFolderSelect = () => {
+  if (uploadState.value !== 'idle') return;
+  folderInputRef.value?.click();
+};
+
+const handleFolderSelect = (event: Event) => {
+  const target = event.target as HTMLInputElement | null;
+  const files = target?.files;
+  if (!files || files.length === 0) return;
+
+  Array.from(files).forEach((file) => addFileToList(file));
+  // Reset input so selecting the same folder again works
+  if (target) {
+    target.value = '';
+  }
+};
+
 const handleRemove: UploadProps['onRemove'] = file => {
   const index = fileList.value!.indexOf(file);
   const newFiles = fileList.value!.slice();
@@ -56,18 +106,7 @@ const handleRemove: UploadProps['onRemove'] = file => {
 const beforeUpload: UploadProps['beforeUpload'] = (file) => {
   // Handle both files and directories
   if (file) {
-    if (!fileList.value) fileList.value = [];
-    fileList.value.push(file);
-
-    // Check if it's a directory upload
-    if ((file as any).webkitRelativePath) {
-      isFolderUpload.value = true;
-    } else {
-      // For multiple files, we'll create a zip
-      if (fileList.value.length > 1) {
-        isFolderUpload.value = true;
-      }
-    }
+    addFileToList(file);
   }
   return false;
 };
@@ -139,55 +178,72 @@ const getFolderName = () => {
 const handleChange: UploadProps['onChange'] = ({ fileList: newFileList }) => {
   // Update the file list when files are added or removed
   if (newFileList && newFileList.length > 0) {
-    fileList.value = newFileList;
+    const cleanedList = dedupeFiles(newFileList);
+    fileList.value = cleanedList;
 
-    // Check if any files have webkitRelativePath (indicating folder upload)
-    const hasFolderFiles = newFileList.some(file => (file as any).originFileObj?.webkitRelativePath);
-    const hasMultipleFiles = newFileList.length > 1;
-
-    // Set isFolderUpload to true for folder uploads or multiple files
-    isFolderUpload.value = hasFolderFiles || hasMultipleFiles;
-    
-    // Clear Ant Design's internal file list after processing
-    setTimeout(() => {
-      if (uploadRef.value) {
-        uploadRef.value.fileList = [];
-      }
-    }, 0);
+    const hasMultipleFiles = cleanedList.length > 1;
+    // Treat as folder upload when multiple files or any relative path exists
+    isFolderUpload.value = hasMultipleFiles || isFolderLike(cleanedList);
   }
 };
 
+type FileSystemFileEntry = FileSystemEntry & {
+  file: (callback: (file: File) => void) => void;
+  fullPath: string;
+};
+
+type FileSystemDirectoryReader = {
+  readEntries: (cb: (entries: FileSystemEntry[]) => void) => void;
+};
+
+type FileSystemDirectoryEntry = FileSystemEntry & {
+  createReader: () => FileSystemDirectoryReader;
+};
+
 const handleDrop = (e: DragEvent) => {
+  e.preventDefault();
+  e.stopPropagation();
   // Handle drop event for folder structure
   const items = e.dataTransfer?.items;
   if (items) {
+    let hasDirectory = false;
     for (let i = 0; i < items.length; i++) {
       const item = items[i];
       if (item.kind === 'file') {
         const entry = item.webkitGetAsEntry();
         if (entry) {
-          processEntry(entry);
+          if (entry.isDirectory) {
+            hasDirectory = true;
+            processEntry(entry);
+          } else {
+            const fileEntry = entry as FileSystemFileEntry;
+            if (typeof fileEntry.file === 'function') {
+              fileEntry.file((file: File) => addFileToList(file));
+            }
+          }
         }
       }
     }
   }
 };
 
-const processEntry = (entry: any) => {
+const processEntry = (entry: FileSystemEntry) => {
   if (entry.isFile) {
-    entry.file((file: File) => {
-      // Add file to file list with relative path
-      const fileWithPath = Object.assign(file, {
-        webkitRelativePath: entry.fullPath.replace(/^\//, '')
+    const fileEntry = entry as FileSystemFileEntry;
+    if (typeof fileEntry.file === 'function') {
+      fileEntry.file((file: File) => {
+        const cleanPath = fileEntry.fullPath.replace(/^\//, '');
+        const pathParts = cleanPath.split('/').filter(Boolean);
+        // Only keep relative path when a real folder structure exists.
+        const fileWithPath = pathParts.length > 1
+          ? Object.assign(file, { webkitRelativePath: cleanPath })
+          : file;
+        addFileToList(fileWithPath as any);
       });
-      if (!fileList.value) fileList.value = [];
-      fileList.value.push(fileWithPath as any);
-    });
+    }
   } else if (entry.isDirectory) {
-    const reader = entry.createReader();
-    reader.readEntries((entries: any[]) => {
-      entries.forEach(processEntry);
-    });
+    const reader = (entry as FileSystemDirectoryEntry).createReader();
+    reader.readEntries((entries: FileSystemEntry[]) => entries.forEach(processEntry));
   }
 };
 
@@ -207,18 +263,43 @@ const getAccessId = async () => {
   }
 
   try {
-    const fileToUpload = isFolderUpload.value ? zipFile.value : fileList.value[0];
+    const fileToUpload = (isFolderUpload.value ? zipFile.value : fileList.value?.[0]) as File | undefined;
     if (!fileToUpload) {
       message.error('没有可上传的文件');
       return;
     }
-    const response = await fetch(`/api/fileflow/id?file_name=${fileToUpload.name}&file_size=${fileToUpload.size}`);
-    const body = await response.json();
-    accessId.value = body.data.id;
+
+    const fileSize = fileToUpload.size ?? 0;
+    if (fileSize === 0) {
+      message.error('无法获取文件大小');
+      return;
+    }
+
+    if (fileSize > MAX_TOTAL_SIZE) {
+      message.error('文件过大，单次上传上限为 1GB');
+      return;
+    }
+    const { data, response } = await fetchJsonWithRetry<{ success?: boolean; data?: { id: string } }>(
+      `/api/fileflow/id?file_name=${fileToUpload.name}&file_size=${fileSize}`,
+      { method: 'get' },
+      { timeoutMs: 12000, retries: 2 },
+    );
+
+    if (!response.ok) {
+      const msg = (data as any)?.message || '未能获取有效的 AccessId';
+      throw new Error(msg);
+    }
+
+    if (!data?.data?.id) {
+      throw new Error('未能获取有效的 AccessId');
+    }
+
+    accessId.value = data.data.id;
     message.success('AccessId 获取成功，请将链接分享给接收方');
     return accessId.value;
   } catch (error) {
-    message.error('获取 AccessId 失败');
+    const msg = error instanceof Error ? error.message : '未知错误';
+    message.error(`获取 AccessId 失败: ${msg}`);
     throw error;
   }
 };
@@ -259,11 +340,14 @@ const handleUpload = async () => {
     let pollCount = 0;
 
     while (!isUsing && pollCount < maxPollCount) {
-      const statusResponse = await fetch(`/api/fileflow/${accessId.value}/status`);
-      const statusData = await statusResponse.json();
+      const { data: statusData } = await fetchJsonWithRetry<{ success?: boolean; data?: { is_using?: boolean } }>(
+        `/api/fileflow/${accessId.value}/status`,
+        { method: 'get' },
+        { timeoutMs: 6000, retries: 2 },
+      );
 
       // Check if is_using is true
-      if (statusData.success && statusData.data && statusData.data.is_using) {
+      if (statusData?.success && statusData.data && statusData.data.is_using) {
         isUsing = true;
         uploadState.value = 'processing';
         message.success('接收方已连接，开始上传文件...');
@@ -341,27 +425,11 @@ const handleUpload = async () => {
       return;
     }
 
-    const p2pResult = await sendViaWebRtc(accessId.value, nativeFile, {
-      onProgress: (percent) => {
-        uploadProgress.value = percent;
-      },
-      onStatus: (status) => {
-        if (status.startsWith('fallback')) {
-          message.warning('P2P 失败，切换到服务器上传');
-        }
-      },
-    });
-
-    if (p2pResult.status === 'success') {
-      uploadState.value = 'finished';
-      message.success('P2P 发送完成！等待接收方下载完成...');
-    } else {
-      uploadedLength.value = 0;
-      uploadProgress.value = 0;
-      await uploadViaHttp();
-      uploadState.value = 'finished';
-      message.success('文件上传成功！等待接收方下载完成...');
-    }
+    uploadedLength.value = 0;
+    uploadProgress.value = 0;
+    await uploadViaHttp();
+    uploadState.value = 'finished';
+    message.success('文件上传成功！等待接收方下载完成...');
 
     let retry: number = 0;
     // Start polling to check if download is complete
@@ -372,10 +440,13 @@ const handleUpload = async () => {
       }
 
       try {
-        const response = await fetch(`/api/fileflow/${accessId.value}/status`);
-        const data = await response.json();
+        const { data } = await fetchJsonWithRetry<{ success?: boolean; data?: { done?: boolean } }>(
+          `/api/fileflow/${accessId.value}/status`,
+          { method: 'get' },
+          { timeoutMs: 6000, retries: 2 },
+        );
 
-        if (data.success && data.data && data.data.done) {
+        if (data?.success && data.data && data.data.done) {
           message.success('接收方已下载完成！');
           // Reset everything after a short delay
           setTimeout(() => {
@@ -402,18 +473,17 @@ const handleUpload = async () => {
 };
 
 
-const sayHello = () => {
-  fetch('/api/fileflow/hello')
-    .then(response => {
-      if (response.status === 200) {
-        is_online.value = true;
-      } else {
-        is_online.value = false;
-      }
-    })
-    .catch(() => {
-      is_online.value = false;
-    });
+const sayHello = async () => {
+  try {
+    const response = await fetchWithRetry(
+      '/api/fileflow/hello',
+      { method: 'get' },
+      { timeoutMs: 3000, retries: 1 },
+    );
+    is_online.value = response.ok;
+  } catch {
+    is_online.value = false;
+  }
 };
 
 onMounted(() => {
@@ -449,12 +519,12 @@ onUnmounted(() => {
 
         <div class="file-upload-area">
           <Upload.Dragger ref="uploadRef" :file-list="fileList" :before-upload="beforeUpload" @remove="handleRemove"
-            :disabled="uploadState !== 'idle'" :multiple="true" :directory="true" name="file" :show-upload-list="false"
+            :disabled="uploadState !== 'idle'" :multiple="true" name="file" :show-upload-list="false"
             @change="handleChange" @drop="handleDrop">
             <div class="upload-area-wrapper">
-              <p class="ant-upload-text">点击或拖拽文件到此区域上传</p>
+              <p class="ant-upload-text">点击或拖拽文件/文件夹到此区域上传</p>
               <p class="ant-upload-hint">
-                支持单个文件、多个文件或文件夹上传。请勿上传敏感数据。
+                支持文件或文件夹上传；多个文件或文件夹将自动打包。请勿上传敏感数据。
               </p>
             </div>
           </Upload.Dragger>
@@ -483,14 +553,19 @@ onUnmounted(() => {
           </div>
         </div>
 
-        <Button type="primary" size="large" :disabled="!fileList || fileList.length === 0 || uploadState !== 'idle'"
-          :loading="uploadState === 'pending' || uploadState === 'processing'" @click="handleUpload"
-          class="upload-button">
+        <div class="action-buttons">
+          <Button type="default" size="large" :disabled="uploadState !== 'idle'" @click="triggerFolderSelect">
+            选择文件夹
+          </Button>
+          <Button type="primary" size="large" :disabled="!fileList || fileList.length === 0 || uploadState !== 'idle'"
+            :loading="uploadState === 'pending' || uploadState === 'processing'" @click="handleUpload"
+            class="upload-button">
           <template #icon>
             <HardDrive />
           </template>
           {{ uploadState === 'processing' ? '上传中...' : uploadState === 'pending' ? '等待对方接收' : '获取链接并上传' }}
-        </Button>
+          </Button>
+        </div>
 
         <div v-if="uploadState === 'processing'" class="progress-container">
           <Progress :percent="uploadProgress" size="small" />
@@ -500,16 +575,19 @@ onUnmounted(() => {
         <div class="instructions">
           <Title :level="5">使用说明:</Title>
           <ul>
-            <li>点击上传区域或拖拽文件/文件夹到此区域</li>
-            <li>支持单个文件、多个文件或整个文件夹上传</li>
-            <li>多个文件或文件夹将自动打包成压缩文件</li>
-            <li>点击"获取链接并上传"按钮获取分享链接并开始上传</li>
-            <li>将链接发送给文件接收方</li>
-            <li>等待接收方访问链接后，文件将自动开始上传</li>
-            <li>上传过程中请勿关闭页面</li>
+            <li>选择或拖拽文件/文件夹；多个文件会自动打包</li>
+            <li>点击“获取链接并上传”，将生成的链接发给接收方</li>
+            <li>接收方打开链接后开始上传，过程中请保持此页开启</li>
           </ul>
         </div>
       </Space>
+      <input
+        ref="folderInputRef"
+        type="file"
+        webkitdirectory
+        style="display: none"
+        @change="handleFolderSelect"
+      />
     </div>
   </div>
 </template>
@@ -634,13 +712,20 @@ onUnmounted(() => {
   word-break: break-all;
 }
 
-.upload-button {
+.action-buttons {
   display: flex;
-  justify-content: center;
   width: 100%;
+  gap: 12px;
+  margin: 8px 0;
+}
+
+.upload-button {
+  flex: 1;
   height: 48px;
   font-size: 16px;
-  margin: 8px 0;
+  display: flex;
+  justify-content: center;
+  align-items: center;
   gap: 16px;
 }
 

@@ -4,8 +4,7 @@ use tower_http::timeout::TimeoutLayer;
 use tracing::{event, instrument, Level};
 use std::time::Duration;
 
-use crate::service::handler::{download, get_assets, get_file, get_id, get_status, upload, upload_file, done};
-use crate::service::signaling::{signal_ws, webrtc_config};
+use crate::service::handler::{download, get_assets, get_file, get_id, get_status, upload, upload_file, done, home};
 use tower_http::services::ServeDir;
 
 fn api_router() -> Router {
@@ -15,8 +14,6 @@ fn api_router() -> Router {
             event!(Level::TRACE, "Hello endpoint accessed");
             "Hi!"
         }))
-        .route("/webrtc-config", get(webrtc_config))
-        .route("/signal/{room_id}", get(signal_ws))
         .route("/id", get(get_id))
         .route("/{id}/status", get(get_status))
         // Add timeout layer specifically for upload api
@@ -36,7 +33,9 @@ fn assets_router() -> Router {
 
 fn view_router() -> Router {
     Router::new()
-        .route("/", get(upload))
+        .route("/", get(home))
+        .route("/upload", get(upload))
+        .route("/download", get(download))
         .route("/{id}/file", get(download))
 }
 

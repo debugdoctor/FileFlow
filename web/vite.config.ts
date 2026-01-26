@@ -27,6 +27,7 @@ export default defineConfig({
   build: {
     rollupOptions: {
       input: {
+        index: fileURLToPath(new URL('./index.html', import.meta.url)),
         upload: fileURLToPath(new URL('./upload/index.html', import.meta.url)),
         download: fileURLToPath(new URL('./download/index.html', import.meta.url)),
       }

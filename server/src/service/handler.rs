@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, env};
 
 use crate::{
     dao::db::{MetaInfo, FileBlock},
@@ -12,15 +12,83 @@ use mime_guess;
 use serde::Deserialize;
 use serde_json::json;
 use tracing::{event, instrument, Level};
+use lazy_static::lazy_static;
 
-/// Maximum size of each file block in bytes (1MB)
-const MAX_BLOCK_SIZE: u64 = 1024 * 1024;
-/// Maximum number of blocks allowed per file (increased to support larger zip files)
-const MAX_BLOCKS_PER_FILE: usize = 16;
+lazy_static! {
+    static ref MAX_BLOCK_SIZE: u64 = read_env_u64("MAX_BLOCK_SIZE", 1024 * 1024);
+    static ref MAX_BLOCKS_PER_FILE: usize = read_env_usize("MAX_BLOCKS_PER_FILE", 1024);
+}
+
 /// Maximum number of retry attempts for database operations
 const MAX_RETRIES: u32 = 5;
 /// Interval between retry attempts in milliseconds
 const RETRY_INTERVAL: u64 = 250;
+/// TTL for metadata entries (seconds)
+const META_TTL_SECS: u64 = 60 * 60 * 24;
+/// TTL for file block entries (seconds)
+const BLOCK_TTL_SECS: u64 = 60;
+/// Retry settings for fetching file blocks (kept below client timeout)
+const BLOCK_FETCH_MAX_RETRIES: u32 = 60;
+const BLOCK_FETCH_RETRY_INTERVAL: u64 = 250;
+
+/// Aggregate file size limit derived from block constraints
+fn max_total_size() -> u64 {
+    max_block_size() * max_blocks_per_file() as u64
+}
+/// Maximum size of each file block in bytes (default 1MB, configurable via MAX_BLOCK_SIZE)
+fn max_block_size() -> u64 {
+    *MAX_BLOCK_SIZE
+}
+/// Maximum number of blocks allowed per file (default 1024, configurable via MAX_BLOCKS_PER_FILE)
+fn max_blocks_per_file() -> usize {
+    *MAX_BLOCKS_PER_FILE
+}
+
+fn parse_u64_param(value: Option<&String>, field: &str) -> Result<u64, (StatusCode, Json<serde_json::Value>)> {
+    let raw = value.ok_or_else(|| {
+        event!(Level::WARN, "Missing Parameter: {}", field);
+        (StatusCode::BAD_REQUEST, Json(json!({
+            "code": 400,
+            "success": false,
+            "message": format!("Missing Parameter: {}", field)
+        })))
+    })?;
+
+    raw.parse::<u64>().map_err(|_| {
+        event!(Level::WARN, "Invalid numeric Parameter: {}", field);
+        (StatusCode::BAD_REQUEST, Json(json!({
+            "code": 400,
+            "success": false,
+            "message": format!("Invalid Parameter: {}", field)
+        })))
+    })
+}
+
+fn read_env_u64(key: &str, default: u64) -> u64 {
+    match env::var(key) {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(value) if value > 0 => value,
+            _ => {
+                event!(Level::WARN, "{} is invalid (value: '{}'), using default {}", key, raw, default);
+                default
+            }
+        },
+        Err(_) => default,
+    }
+}
+
+fn read_env_usize(key: &str, default: usize) -> usize {
+    match env::var(key) {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(value) if value > 0 => value.min(usize::MAX as u64) as usize,
+            _ => {
+                event!(Level::WARN, "{} is invalid (value: '{}'), using default {}", key, raw, default);
+                default
+            }
+        },
+        Err(_) => default,
+    }
+}
 
 /// Data transfer object for file information
 #[derive(Debug, Deserialize)]
@@ -29,6 +97,22 @@ struct FileInfo {
     pub start: u64,
     pub end: u64,
     pub total: u64,
+}
+
+/// Handler for serving the landing page
+/// Returns the index HTML page or 404 if not found
+#[instrument]
+pub async fn home() -> impl IntoResponse {
+    match StaticFiles::get("index.html") {
+        Some(content) => {
+            let html = String::from_utf8(content.data.to_vec()).unwrap();
+            Html(html).into_response()
+        }
+        None => {
+            event!(Level::ERROR, "Landing page not found");
+            (StatusCode::NOT_FOUND, "Page not found").into_response()
+        },
+    }
 }
 
 /// Handler for serving the upload page
@@ -72,29 +156,44 @@ pub async fn get_id(
     let id = nanoid::generate();
 
     let file_name = query.get("file_name").unwrap_or(&String::new()).to_string();
-    let file_size = query.get("file_size").unwrap_or(&String::from("0")).parse::<u64>().unwrap();
+    let file_size = match parse_u64_param(query.get("file_size"), "file_size") {
+        Ok(size) => size,
+        Err(err) => return err.into_response(),
+    };
+
+    if file_size > max_total_size() {
+        event!(Level::WARN, "File too large during ID request: {} bytes > {}", file_size, max_total_size());
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "code": 400,
+                "success": false,
+                "message": "File exceeds maximum allowed size"
+            }))
+        )
+        .into_response();
+    }
 
     // Changed from INFO to DEBUG to reduce log verbosity
     event!(Level::DEBUG, "Generating new ID for file '{}' with size {}", file_name, file_size);
 
     let meta_info = MetaInfo::new(file_name, file_size);
 
-    match MetaInfo::get_db()
-        .insert(&id, meta_info, 60 * 60 * 24)
-        .await
-    {
+    match MetaInfo::get_db().insert(&id, meta_info, META_TTL_SECS).await {
         Ok(_) => {
             // Changed from INFO to DEBUG to reduce log verbosity
             event!(Level::DEBUG, "Successfully generated ID: {}", id);
         },
         Err(e) => {
             event!(Level::ERROR, "Failed to insert meta info into DB: {}", e);
-            return Json(json!({
-                "code": 500,
-                "success": false,
-                "message": "Internal Server Error"
-            }))
-            .into_response();
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "code": 500,
+                    "success": false,
+                    "message": "Internal Server Error"
+                }))
+            ).into_response();
         }
     };
 
@@ -120,25 +219,31 @@ pub async fn get_status(Path(id): Path<String>) -> impl IntoResponse {
         Some(meta_info) => {
             // Changed from DEBUG to TRACE to reduce log verbosity
             event!(Level::TRACE, "Status checked for ID: {}", id);
-            Json(json!({
-                "code": 200,
-                "success": true,
-                "data": {
-                    "file_name": meta_info.value.file_name,
-                    "file_size": meta_info.value.file_size,
-                    "is_using": meta_info.value.is_using,
-                    "done": meta_info.value.done,
-                }
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "code": 200,
+                    "success": true,
+                    "data": {
+                        "file_name": meta_info.value.file_name,
+                        "file_size": meta_info.value.file_size,
+                        "is_using": meta_info.value.is_using,
+                        "done": meta_info.value.done,
+                    }
 
-            }))
+                }))
+            )
         },
         None => {
             event!(Level::WARN, "Status check failed - ID not found: {}", id);
-            Json(json!({
-                "code": 404,
-                "success": false,
-                "message": "Not Found"
-            }))
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({
+                    "code": 404,
+                    "success": false,
+                    "message": "Not Found"
+                }))
+            )
         },
     }
 }
@@ -166,19 +271,9 @@ pub async fn get_file(
         }
     };
 
-    let start = match query.get("start") {
-        Some(start) => start.parse::<u64>().unwrap(),
-        None => {
-            event!(Level::WARN, "Missing Parameter: start");
-            return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({
-                "code": 400,
-                "success": false,
-                "message": "Missing Parameter: start"
-            })))
-            .into_response();
-        }
+    let start = match parse_u64_param(query.get("start"), "start") {
+        Ok(s) => s,
+        Err(err) => return err.into_response(),
     };
 
     if start == 0 {
@@ -270,7 +365,7 @@ pub async fn get_file(
         }
     };
 
-    // Retry logic for getting file block with 5 retries and 250ms intervals
+    // Retry logic for getting file block with extended retries while staying under client timeout
     let mut retries = 0;
     
     let (block_name, block_data, block_start, block_end, block_total) = loop {
@@ -292,12 +387,20 @@ pub async fn get_file(
                 break (file_block.value.filename, file_block.value.data, file_block.value.start, file_block.value.end, file_block.value.total);
             },
             None => {
-                if retries >= MAX_RETRIES {
-                    event!(Level::ERROR, "Block {}:{:012} Not Found after {} retries", &id, start, MAX_RETRIES);
-                    return (StatusCode::NOT_FOUND, format!("Block {}:{:012} Not Found", &id, start)).into_response();
+                if retries >= BLOCK_FETCH_MAX_RETRIES {
+                    event!(Level::WARN, "Block {}:{:012} not ready after {} retries", &id, start, BLOCK_FETCH_MAX_RETRIES);
+                    return (
+                        StatusCode::TOO_EARLY,
+                        Json(json!({
+                            "code": 425,
+                            "success": false,
+                            "message": "Block not ready, retry shortly"
+                        }))
+                    )
+                    .into_response();
                 }
                 retries += 1;
-                tokio::time::sleep(tokio::time::Duration::from_millis(RETRY_INTERVAL)).await;
+                tokio::time::sleep(tokio::time::Duration::from_millis(BLOCK_FETCH_RETRY_INTERVAL)).await;
             }
         }
     };
@@ -345,28 +448,23 @@ pub async fn upload_file(Path(id): Path<String>, multipart: Multipart) -> impl I
     // Changed from INFO to DEBUG to reduce log verbosity for large files
     event!(Level::DEBUG, "Starting file upload for ID: {}", id);
     
-    // Check if receiver had visited this id
+    // Allow upload even if receiver hasn't connected yet; only require a valid ID.
     match MetaInfo::get_db().get(&id).await {
         Some(meta_info) => {
             if !meta_info.value.is_using {
-                event!(Level::WARN, "Receiver had not visited this id: {}", id);
-                return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({
-                    "code": 400,
-                    "success": false,
-                    "message": "Receiver had not visited this id"
-                })))
-                .into_response();
+                event!(Level::DEBUG, "Receiver not connected yet for ID: {}", id);
             }
         },
         None => {
             event!(Level::WARN, "Missing Access ID: {}", id);
-            return Json(json!({
-                "code": 404,
-                "success": false,
-                "message": "Missing Access ID"
-            }))
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({
+                    "code": 404,
+                    "success": false,
+                    "message": "Missing Access ID"
+                }))
+            )
             .into_response();
         }
     };
@@ -384,20 +482,26 @@ pub async fn upload_file(Path(id): Path<String>, multipart: Multipart) -> impl I
         Ok(Some(field)) => Some(field),
         Ok(None) => {
             event!(Level::ERROR, "Missing info part");
-            return Json(json!({
-                "code": 400,
-                "success": false,
-                "message": "Bad Request: Missing info part"
-            }))
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "code": 400,
+                    "success": false,
+                    "message": "Bad Request: Missing info part"
+                }))
+            )
             .into_response();
         }
         Err(e) => {
             event!(Level::ERROR, "Failed to process multipart: {}", e);
-            return Json(json!({
-                "code": 500,
-                "success": false,
-                "message": "Internal Server Error"
-            }))
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "code": 500,
+                    "success": false,
+                    "message": "Internal Server Error"
+                }))
+            )
             .into_response();
         }
     } {
@@ -405,22 +509,28 @@ pub async fn upload_file(Path(id): Path<String>, multipart: Multipart) -> impl I
             Some(name) => name.to_string(),
             None => {
                 event!(Level::WARN, "Field name is missing");
-                return Json(json!({
-                    "code": 400,
-                    "success": false,
-                    "message": "Field name is missing"
-                }))
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "code": 400,
+                        "success": false,
+                        "message": "Field name is missing"
+                    }))
+                )
                 .into_response();
             }
         };
 
         if name != "info" {
             event!(Level::WARN, "First part must be info");
-            return Json(json!({
-                "code": 400,
-                "success": false,
-                "message": "First part must be info"
-            }))
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "code": 400,
+                    "success": false,
+                    "message": "First part must be info"
+                }))
+            )
             .into_response();
         }
 
@@ -428,11 +538,14 @@ pub async fn upload_file(Path(id): Path<String>, multipart: Multipart) -> impl I
             Ok(data) => data,
             Err(err) => {
                 event!(Level::ERROR, "Failed to read field bytes: {}", err);
-                return Json(json!({
-                    "code": 500,
-                    "success": false,
-                    "message": "Failed to read file data"
-                }))
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({
+                        "code": 500,
+                        "success": false,
+                        "message": "Failed to read file data"
+                    }))
+                )
                 .into_response();
             }
         };
@@ -441,11 +554,14 @@ pub async fn upload_file(Path(id): Path<String>, multipart: Multipart) -> impl I
             Ok(info) => info,
             Err(err) => {
                 event!(Level::ERROR, "Failed to parse info json: {}", err);
-                return Json(json!({
-                    "code": 400,
-                    "success": false,
-                    "message": "Failed to parse info json"
-                }))
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "code": 400,
+                        "success": false,
+                        "message": "Failed to parse info json"
+                    }))
+                )
                 .into_response();
             }
         };
@@ -454,6 +570,33 @@ pub async fn upload_file(Path(id): Path<String>, multipart: Multipart) -> impl I
         start = info.start;
         end = info.end;
         total = info.total;
+
+        if end < start || total == 0 || start >= total {
+            event!(Level::WARN, "Invalid range in info part: start={}, end={}, total={}", start, end, total);
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "code": 400,
+                    "success": false,
+                    "message": "Invalid file range"
+                }))
+            )
+            .into_response();
+        }
+
+        let max_total = max_total_size();
+        if total > max_total {
+            event!(Level::WARN, "File too large: {} > {}", total, max_total);
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "code": 400,
+                    "success": false,
+                    "message": "File exceeds maximum allowed size"
+                }))
+            )
+            .into_response();
+        }
         
         // Changed from DEBUG to TRACE to reduce log verbosity for large files
         event!(Level::TRACE, "Processed info part for file '{}' with range {}-{} of total {}", filename, start, end, total);
@@ -464,20 +607,26 @@ pub async fn upload_file(Path(id): Path<String>, multipart: Multipart) -> impl I
         Ok(Some(field)) => Some(field),
         Ok(None) => {
             event!(Level::ERROR, "Missing file part");
-            return Json(json!({
-                "code": 400,
-                "success": false,
-                "message": "Missing file part"
-            }))
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "code": 400,
+                    "success": false,
+                    "message": "Missing file part"
+                }))
+            )
             .into_response();
         }
         Err(err) => {
             event!(Level::ERROR, "Failed to process multipart: {}", err);
-            return Json(json!({
-                "code": 500,
-                "success": false,
-                "message": "Internal Server Error"
-            }))
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "code": 500,
+                    "success": false,
+                    "message": "Internal Server Error"
+                }))
+            )
             .into_response();
         }
     } {
@@ -485,22 +634,28 @@ pub async fn upload_file(Path(id): Path<String>, multipart: Multipart) -> impl I
             Some(name) => name.to_string(),
             None => {
                 event!(Level::WARN, "Field name is missing");
-                return Json(json!({
-                    "code": 400,
-                    "success": false,
-                    "message": "Field name is missing"
-                }))
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "code": 400,
+                        "success": false,
+                        "message": "Field name is missing"
+                    }))
+                )
                 .into_response();
             }
         };
 
         if name != "file" {
             event!(Level::WARN, "Second part must be file");
-            return Json(json!({
-                "code": 400,
-                "success": false,
-                "message": "Second part must be file"
-            }))
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "code": 400,
+                    "success": false,
+                    "message": "Second part must be file"
+                }))
+            )
             .into_response();
         }
 
@@ -508,22 +663,42 @@ pub async fn upload_file(Path(id): Path<String>, multipart: Multipart) -> impl I
             Ok(data) => data,
             Err(err) => {
                 event!(Level::ERROR, "Failed to read field bytes: {}", err);
-                return Json(json!({
-                    "code": 500,
-                    "success": false,
-                    "message": "Internal Server Error: Failed to read file data"
-                }))
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({
+                        "code": 500,
+                        "success": false,
+                        "message": "Internal Server Error: Failed to read file data"
+                    }))
+                )
                 .into_response();
             }
         };
 
         // Check block size limit
-        if data.len() as u64 > MAX_BLOCK_SIZE {
-            return Json(json!({
-                "code": 400,
-                "success": false,
-                "message": "Block size exceeds maximum limitation"
-            }))
+        if data.len() as u64 > max_block_size() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "code": 400,
+                    "success": false,
+                    "message": "Block size exceeds maximum limitation"
+                }))
+            )
+            .into_response();
+        }
+
+        let expected_len = end.saturating_sub(start).saturating_add(1);
+        if data.len() as u64 != expected_len {
+            event!(Level::WARN, "Mismatched block length for ID {}: expected {}, got {}", id, expected_len, data.len());
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "code": 400,
+                    "success": false,
+                    "message": "Block size mismatch"
+                }))
+            )
             .into_response();
         }
         // Check if meet the max blocks per file in cache
@@ -537,18 +712,21 @@ pub async fn upload_file(Path(id): Path<String>, multipart: Multipart) -> impl I
                 block_count += 1;
             }
 
-            if block_count >= MAX_BLOCKS_PER_FILE {
+            if block_count >= max_blocks_per_file() {
                 break;
             }
         }
         drop(store);
 
-        if block_count >= MAX_BLOCKS_PER_FILE {
-            return Json(json!({
-                  "code": 400,
-                  "success": false,
-                  "message": format!("Maximum number of blocks per file reached ({})", MAX_BLOCKS_PER_FILE)
-            }))
+        if block_count >= max_blocks_per_file() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                      "code": 400,
+                      "success": false,
+                      "message": format!("Maximum number of blocks per file reached ({})", max_blocks_per_file())
+                }))
+            )
             .into_response();
         }
 
@@ -561,7 +739,7 @@ pub async fn upload_file(Path(id): Path<String>, multipart: Multipart) -> impl I
         );
 
         match FileBlock::get_db()
-            .insert(&format!("{}:{:012}", &id, start), file_block, 60)
+            .insert(&format!("{}:{:012}", &id, start), file_block, BLOCK_TTL_SECS)
             .await
         {
             Ok(_) => {
@@ -570,11 +748,14 @@ pub async fn upload_file(Path(id): Path<String>, multipart: Multipart) -> impl I
             },
             Err(e) => {
                 event!(Level::ERROR, "Failed to insert file block into DB: {} for ID: {}", e, id);
-                return Json(json!({
-                    "code": 500,
-                    "success": false,
-                    "message": "Internal Server Error"
-                }))
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({
+                        "code": 500,
+                        "success": false,
+                        "message": "Internal Server Error"
+                    }))
+                )
                 .into_response();
             }
         }
@@ -599,29 +780,38 @@ pub async fn done(Path(id): Path<String>, Json(_payload): Json<serde_json::Value
             match MetaInfo::get_db().update(&id, meta_info.value, meta_info.exp).await {
                 Ok(_) => {
                     event!(Level::DEBUG, "Download marked as complete for ID: {}", id);
-                    Json(json!({
-                        "code": 200,
-                        "success": true,
-                        "message": "Download completion marked successfully"
-                    }))
+                    (
+                        StatusCode::OK,
+                        Json(json!({
+                            "code": 200,
+                            "success": true,
+                            "message": "Download completion marked successfully"
+                        }))
+                    )
                 },
                 Err(e) => {
                     event!(Level::ERROR, "Failed to update download completion status: {}", e);
-                    Json(json!({
-                        "code": 500,
-                        "success": false,
-                        "message": "Internal Server Error"
-                    }))
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({
+                            "code": 500,
+                            "success": false,
+                            "message": "Internal Server Error"
+                        }))
+                    )
                 }
             }
         },
         None => {
             event!(Level::WARN, "ID not found for download completion: {}", id);
-            Json(json!({
-                "code": 404,
-                "success": false,
-                "message": "Not Found"
-            }))
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({
+                    "code": 404,
+                    "success": false,
+                    "message": "Not Found"
+                }))
+            )
         }
     }
 }
