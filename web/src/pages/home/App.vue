@@ -27,7 +27,7 @@ const goDownload = () => {
               <Upload :size="28" />
               <span>我要上传</span>
             </div>
-            <Text type="secondary">生成链接，与接收方点对点传输</Text>
+            <Text type="secondary">生成接收 ID，与接收方点对点传输</Text>
             <Button type="primary" size="large" block @click="goUpload">进入上传</Button>
           </Space>
         </div>

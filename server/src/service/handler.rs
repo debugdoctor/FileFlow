@@ -1,7 +1,7 @@
 use std::{collections::HashMap, env};
 
 use crate::{
-    dao::db::{MetaInfo, FileBlock},
+    dao::db::{FileBlock, MetaInfo, SignalMessage, SignalState},
     service::static_files::StaticFiles,
     utils::nanoid,
 };
@@ -27,6 +27,8 @@ const RETRY_INTERVAL: u64 = 250;
 const META_TTL_SECS: u64 = 60 * 60 * 24;
 /// TTL for file block entries (seconds)
 const BLOCK_TTL_SECS: u64 = 60;
+/// TTL for signaling data (seconds)
+const SIGNAL_TTL_SECS: u64 = 60 * 60;
 /// Retry settings for fetching file blocks (kept below client timeout)
 const BLOCK_FETCH_MAX_RETRIES: u32 = 60;
 const BLOCK_FETCH_RETRY_INTERVAL: u64 = 250;
@@ -99,6 +101,22 @@ struct FileInfo {
     pub total: u64,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct SignalPostPayload {
+    pub role: String,
+    #[serde(rename = "type")]
+    pub msg_type: String,
+    pub data: serde_json::Value,
+    pub rid: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SignalQuery {
+    pub role: String,
+    pub since: Option<u64>,
+}
+
+
 /// Handler for serving the landing page
 /// Returns the index HTML page or 404 if not found
 #[instrument]
@@ -113,6 +131,168 @@ pub async fn home() -> impl IntoResponse {
             (StatusCode::NOT_FOUND, "Page not found").into_response()
         },
     }
+}
+
+/// Handler for returning P2P configuration (STUN/TURN)
+pub async fn get_p2p_config() -> impl IntoResponse {
+    let stun_server = env::var("STUN_SERVER").ok().and_then(|raw| {
+        let trimmed = raw.trim().to_string();
+        if trimmed.is_empty() { None } else { Some(trimmed) }
+    });
+    let turn_server = env::var("TURN_SERVER").ok().and_then(|raw| {
+        let trimmed = raw.trim().to_string();
+        if trimmed.is_empty() { None } else { Some(trimmed) }
+    });
+    let turn_username = env::var("TURN_USERNAME").ok().and_then(|raw| {
+        let trimmed = raw.trim().to_string();
+        if trimmed.is_empty() { None } else { Some(trimmed) }
+    });
+    let turn_credential = env::var("TURN_CREDENTIAL").ok().and_then(|raw| {
+        let trimmed = raw.trim().to_string();
+        if trimmed.is_empty() { None } else { Some(trimmed) }
+    });
+
+    Json(json!({
+        "code": 200,
+        "success": true,
+        "data": {
+            "stun": stun_server,
+            "turn": turn_server,
+            "turn_username": turn_username,
+            "turn_credential": turn_credential,
+        }
+    }))
+    .into_response()
+}
+
+/// Handler for posting WebRTC signaling messages
+pub async fn post_signal(
+    Path(id): Path<String>,
+    Json(payload): Json<SignalPostPayload>,
+) -> impl IntoResponse {
+    let role = payload.role.trim();
+    if role != "sender" && role != "receiver" {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "code": 400,
+                "success": false,
+                "message": "Invalid role"
+            })),
+        )
+            .into_response();
+    }
+
+    let msg_type = payload.msg_type.trim();
+    if msg_type.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "code": 400,
+                "success": false,
+                "message": "Invalid message type"
+            })),
+        )
+            .into_response();
+    }
+
+    if msg_type == "ready" && role == "receiver" {
+        if let Some(receive_id) = payload.rid.clone() {
+            if let Some(mut meta_info) = MetaInfo::get_db().get(&id).await {
+                meta_info.value.is_using = true;
+                meta_info.value.used_by = receive_id;
+                let _ = MetaInfo::get_db().update(&id, meta_info.value, meta_info.exp).await;
+            }
+        }
+    }
+
+    let mut state = SignalState::get_db()
+        .get(&id)
+        .await
+        .map(|entry| entry.value)
+        .unwrap_or_else(SignalState::new);
+
+    state.seq = state.seq.saturating_add(1);
+    let seq = state.seq;
+    state.messages.push(SignalMessage {
+        seq,
+        from: role.to_string(),
+        msg_type: msg_type.to_string(),
+        data: payload.data,
+        rid: payload.rid,
+    });
+
+    if state.messages.len() > 200 {
+        let drain_len = state.messages.len() - 200;
+        state.messages.drain(0..drain_len);
+    }
+
+    match SignalState::get_db().insert(&id, state, SIGNAL_TTL_SECS).await {
+        Ok(_) => Json(json!({
+            "code": 200,
+            "success": true,
+            "data": {
+                "seq": seq
+            }
+        }))
+        .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "code": 500,
+                "success": false,
+                "message": err
+            })),
+        )
+            .into_response(),
+    }
+}
+
+/// Handler for fetching WebRTC signaling messages
+pub async fn get_signal(
+    Path(id): Path<String>,
+    Query(query): Query<SignalQuery>,
+) -> impl IntoResponse {
+    let role = query.role.trim();
+    if role != "sender" && role != "receiver" {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "code": 400,
+                "success": false,
+                "message": "Invalid role"
+            })),
+        )
+            .into_response();
+    }
+
+    let since = query.since.unwrap_or(0);
+    let state = SignalState::get_db().get(&id).await;
+
+    let (messages, latest) = match state {
+        Some(entry) => {
+            let latest = entry.value.seq;
+            let messages = entry
+                .value
+                .messages
+                .iter()
+                .filter(|msg| msg.seq > since && msg.from != role)
+                .cloned()
+                .collect::<Vec<_>>();
+            (messages, latest)
+        }
+        None => (Vec::new(), since),
+    };
+
+    Json(json!({
+        "code": 200,
+        "success": true,
+        "data": {
+            "latest": latest,
+            "messages": messages
+        }
+    }))
+    .into_response()
 }
 
 /// Handler for serving the upload page

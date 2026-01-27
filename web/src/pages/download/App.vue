@@ -17,6 +17,10 @@ const codeDigits = ref<string[]>(['', '', '', '', '']);
 const codeInputs = ref<Array<HTMLInputElement | null>>([]);
 const activeFileId = ref<string | null>(null);
 
+const P2P_MAX_BUFFERED_AMOUNT = 8 * 1024 * 1024;
+const P2P_CONNECT_TIMEOUT_MS = 5000;
+const P2P_SIGNAL_POLL_MS = 1000;
+
 const formatBytes = (bytes: number, decimals = 2) => {
   if (bytes === 0) return '0 Bytes';
   const k = 1024;
@@ -24,6 +28,86 @@ const formatBytes = (bytes: number, decimals = 2) => {
   const sizes = ['Bytes', 'KB', 'MB', 'GB'];
   const i = Math.floor(Math.log(bytes) / Math.log(k));
   return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
+};
+
+type P2pConfig = {
+  stun?: string;
+  turn?: string;
+  turn_username?: string;
+  turn_credential?: string;
+};
+
+type SignalMessage = {
+  seq: number;
+  from: string;
+  msg_type: string;
+  data: any;
+  rid?: string;
+};
+
+const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+const getP2pConfig = async (): Promise<P2pConfig> => {
+  try {
+    const { data, response } = await fetchJsonWithRetry<{ success?: boolean; data?: P2pConfig }>(
+      '/api/fileflow/p2p-config',
+      { method: 'get' },
+      { timeoutMs: 6000, retries: 1 },
+    );
+    if (response.ok && data?.success) {
+      return data.data || {};
+    }
+  } catch {
+    return {};
+  }
+  return {};
+};
+
+const hasP2pConfig = (config: P2pConfig) => {
+  return !!(config.stun || config.turn);
+};
+
+const buildIceServers = (config: P2pConfig): RTCIceServer[] => {
+  const servers: RTCIceServer[] = [];
+  if (config.stun) {
+    servers.push({ urls: [config.stun] });
+  }
+  if (config.turn) {
+    const turnServer: RTCIceServer = { urls: [config.turn] };
+    if (config.turn_username && config.turn_credential) {
+      turnServer.username = config.turn_username;
+      turnServer.credential = config.turn_credential;
+    }
+    servers.push(turnServer);
+  }
+  return servers;
+};
+
+const postSignal = async (payload: { role: 'sender' | 'receiver'; type: string; data: any; rid?: string }) => {
+  if (!activeFileId.value) {
+    throw new Error('AccessId 为空，无法发送信令');
+  }
+  await fetchWithRetry(
+    `/api/fileflow/${activeFileId.value}/signal`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+    { timeoutMs: 6000, retries: 2 },
+  );
+};
+
+const getSignals = async (role: 'sender' | 'receiver', since: number) => {
+  if (!activeFileId.value) {
+    throw new Error('AccessId 为空，无法获取信令');
+  }
+  const { data } = await fetchJsonWithRetry<{ success?: boolean; data?: { latest?: number; messages?: SignalMessage[] } }>(
+    `/api/fileflow/${activeFileId.value}/signal?role=${role}&since=${since}`,
+    { method: 'get' },
+    { timeoutMs: 6000, retries: 2 },
+  );
+  return data?.data || { latest: since, messages: [] };
 };
 
 const focusInput = (index: number) => {
@@ -89,6 +173,217 @@ const handleCodePaste = (event: ClipboardEvent) => {
       focusInput(sanitized.length);
     }
   });
+};
+
+const downloadViaP2P = async (config: P2pConfig) => {
+  const iceServers = buildIceServers(config);
+  if (iceServers.length === 0) {
+    throw new Error('P2P 配置为空');
+  }
+
+  const receiverId = localStorage.getItem('rid') || '';
+  let signalSeq = 0;
+  let pollActive = true;
+  let completed = false;
+  let shouldCleanup = false;
+  let transferError: Error | null = null;
+
+  let dataChannel: RTCDataChannel | null = null;
+  const pc = new RTCPeerConnection({ iceServers });
+
+  let incomingName = fileName.value || 'downloaded_file';
+  let totalSize = fileSize.value || 0;
+  let receivedBytes = 0;
+  const chunks: ArrayBuffer[] = [];
+
+  const cleanup = () => {
+    pollActive = false;
+    if (dataChannel && dataChannel.readyState !== 'closed') {
+      dataChannel.close();
+    }
+    pc.close();
+  };
+
+  const finalizeDownload = async () => {
+    if (completed) return;
+    completed = true;
+
+    const blob = new Blob(chunks, { type: 'application/octet-stream' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = incomingName || 'downloaded_file';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+
+    message.success('文件下载完成!');
+
+    try {
+      await fetchWithRetry(
+        `/api/fileflow/${activeFileId.value}/done`,
+        {
+          method: 'PUT',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({}),
+        },
+        { timeoutMs: 6000, retries: 2 },
+      );
+    } catch {
+      message.warning('无法通知服务器下载完成，但文件已成功下载');
+    }
+
+    if (dataChannel?.readyState === 'open') {
+      dataChannel.send(JSON.stringify({ type: 'done' }));
+    }
+
+    if (totalSize > 0) {
+      downloadProgress.value = 100;
+    }
+  };
+
+  const handleSignal = async (msg: SignalMessage) => {
+    if (msg.msg_type === 'offer' && msg.data) {
+      await pc.setRemoteDescription(new RTCSessionDescription(msg.data));
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      await postSignal({ role: 'receiver', type: 'answer', data: answer, rid: receiverId });
+    } else if (msg.msg_type === 'candidate' && msg.data) {
+      try {
+        await pc.addIceCandidate(new RTCIceCandidate(msg.data));
+      } catch (error) {
+        console.warn('添加 ICE 候选失败', error);
+      }
+    } else if (msg.msg_type === 'fallback') {
+      throw new Error('发送方要求回退 HTTP');
+    }
+  };
+
+  pc.onicecandidate = (event) => {
+    if (event.candidate) {
+      void postSignal({ role: 'receiver', type: 'candidate', data: event.candidate, rid: receiverId });
+    }
+  };
+
+  pc.onconnectionstatechange = () => {
+    if (['failed', 'disconnected', 'closed'].includes(pc.connectionState) && !completed) {
+      transferError = new Error('P2P 连接中断');
+      completed = true;
+    }
+  };
+
+  const channelReady = new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('P2P 连接超时')), P2P_CONNECT_TIMEOUT_MS);
+    pc.ondatachannel = (event) => {
+      dataChannel = event.channel;
+      dataChannel.binaryType = 'arraybuffer';
+      dataChannel.bufferedAmountLowThreshold = Math.max(64 * 1024, P2P_MAX_BUFFERED_AMOUNT / 2);
+
+      const handleOpen = () => {
+        clearTimeout(timer);
+        resolve();
+      };
+      const handleError = () => {
+        clearTimeout(timer);
+        reject(new Error('P2P 连接失败'));
+      };
+
+      dataChannel.addEventListener('open', handleOpen);
+      dataChannel.addEventListener('error', handleError);
+      dataChannel.addEventListener('close', () => {
+        if (!completed) {
+          transferError = new Error('P2P 连接关闭');
+          completed = true;
+        }
+      });
+      dataChannel.addEventListener('message', async (event) => {
+        if (typeof event.data === 'string') {
+          try {
+            const msg = JSON.parse(event.data);
+            if (msg?.type === 'meta') {
+              if (msg.name) {
+                incomingName = msg.name;
+                fileName.value = msg.name;
+              }
+              if (msg.size) {
+                totalSize = msg.size;
+                fileSize.value = msg.size;
+              }
+              return;
+            }
+            if (msg?.type === 'end') {
+              await finalizeDownload();
+              return;
+            }
+          } catch {
+            return;
+          }
+        }
+
+        if (event.data instanceof ArrayBuffer) {
+          chunks.push(event.data);
+          receivedBytes += event.data.byteLength;
+          if (totalSize > 0) {
+            downloadProgress.value = Math.round((receivedBytes / totalSize) * 100);
+            if (receivedBytes >= totalSize) {
+              await finalizeDownload();
+            }
+          }
+        }
+      });
+    };
+  });
+
+  const pollSignals = async () => {
+    while (pollActive) {
+      try {
+        const signalData = await getSignals('receiver', signalSeq);
+        signalSeq = signalData.latest ?? signalSeq;
+        for (const msg of signalData.messages || []) {
+          await handleSignal(msg);
+        }
+      } catch (error) {
+        console.warn('获取信令失败', error);
+      }
+      await sleep(P2P_SIGNAL_POLL_MS);
+    }
+  };
+
+  try {
+    await postSignal({ role: 'receiver', type: 'ready', data: {}, rid: receiverId });
+    void pollSignals();
+    await channelReady;
+
+    while (!completed) {
+      await sleep(500);
+    }
+    pollActive = false;
+    if (transferError) {
+      throw transferError;
+    }
+    cleanup();
+    return true;
+  } catch (error) {
+    shouldCleanup = true;
+    try {
+      await postSignal({
+        role: 'receiver',
+        type: 'fallback',
+        data: { message: error instanceof Error ? error.message : 'P2P 失败' },
+        rid: receiverId,
+      });
+    } catch {
+      // ignore signaling errors during fallback
+    }
+    throw error;
+  } finally {
+    if (shouldCleanup) {
+      cleanup();
+    }
+  }
 };
 
 const handleGetFile = async () => {
@@ -214,6 +509,21 @@ const handleGetFile = async () => {
     isFinished.value = true;
   };
 
+  const p2pConfig = await getP2pConfig();
+  if (hasP2pConfig(p2pConfig)) {
+    try {
+      message.warning('正在尝试 P2P 连接...');
+      await downloadViaP2P(p2pConfig);
+      isDownloading.value = false;
+      isFinished.value = true;
+      return;
+    } catch (error) {
+      message.warning('P2P 传输失败，已回退到 HTTP');
+      downloadProgress.value = 0;
+      isFinished.value = false;
+    }
+  }
+
   await downloadViaHttp();
 }
 
@@ -222,6 +532,7 @@ onMounted(async () => {
     localStorage.setItem("rid", Math.random().toString(36).slice(2, 10));
   }
 
+  // Get the id from route path name
   const segments = window.location.pathname.split('/').filter(Boolean);
   if (segments.length === 0 || segments[0].length !== 5) {
     requiresCode.value = true;
@@ -321,7 +632,7 @@ onMounted(async () => {
         <div class="instructions">
           <Title :level="5">如何使用:</Title>
           <ul>
-            <li>确保分享链接来自可信来源</li>
+            <li>确保分享 ID 来自可信来源</li>
             <li>点击"开始下载"按钮开始接收文件</li>
             <li>文件将自动保存到您的默认下载目录</li>
             <li>下载过程中请勿关闭此页面</li>

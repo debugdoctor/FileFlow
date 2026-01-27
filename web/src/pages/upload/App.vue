@@ -9,6 +9,10 @@ import JSZip from 'jszip';
 
 const CHUNK_SIZE = 1024 * 1024;
 const MAX_TOTAL_SIZE = CHUNK_SIZE * 1024; // keep in sync with server limits (1GB)
+const P2P_CHUNK_SIZE = 64 * 1024;
+const P2P_MAX_BUFFERED_AMOUNT = 8 * 1024 * 1024;
+const P2P_CONNECT_TIMEOUT_MS = 5000;
+const P2P_SIGNAL_POLL_MS = 1000;
 
 const fileList = ref<UploadProps['fileList']>([]);
 const uploadState = ref<'idle' | 'pending' | 'processing' | 'finished'>('idle');
@@ -26,8 +30,6 @@ const intervalRef = ref<ReturnType<typeof setInterval> | undefined>(undefined)
 const uploadRef = ref<any>(null)
 const folderInputRef = ref<HTMLInputElement | null>(null);
 
-const HOST = window.location.origin;
-
 const { Title, Text } = Typography;
 
 interface UploadInfo {
@@ -38,6 +40,21 @@ interface UploadInfo {
   total: number;
 }
 
+type P2pConfig = {
+  stun?: string;
+  turn?: string;
+  turn_username?: string;
+  turn_credential?: string;
+};
+
+type SignalMessage = {
+  seq: number;
+  from: string;
+  msg_type: string;
+  data: any;
+  rid?: string;
+};
+
 const formatBytes = (bytes: number, decimals = 2) => {
   if (bytes === 0) return '0 Bytes';
   const k = 1024;
@@ -45,6 +62,44 @@ const formatBytes = (bytes: number, decimals = 2) => {
   const sizes = ['Bytes', 'KB', 'MB', 'GB'];
   const i = Math.floor(Math.log(bytes) / Math.log(k));
   return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
+};
+
+const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+const getP2pConfig = async (): Promise<P2pConfig> => {
+  try {
+    const { data, response } = await fetchJsonWithRetry<{ success?: boolean; data?: P2pConfig }>(
+      '/api/fileflow/p2p-config',
+      { method: 'get' },
+      { timeoutMs: 6000, retries: 1 },
+    );
+    if (response.ok && data?.success) {
+      return data.data || {};
+    }
+  } catch {
+    return {};
+  }
+  return {};
+};
+
+const hasP2pConfig = (config: P2pConfig) => {
+  return !!(config.stun || config.turn);
+};
+
+const buildIceServers = (config: P2pConfig): RTCIceServer[] => {
+  const servers: RTCIceServer[] = [];
+  if (config.stun) {
+    servers.push({ urls: [config.stun] });
+  }
+  if (config.turn) {
+    const turnServer: RTCIceServer = { urls: [config.turn] };
+    if (config.turn_username && config.turn_credential) {
+      turnServer.username = config.turn_username;
+      turnServer.credential = config.turn_credential;
+    }
+    servers.push(turnServer);
+  }
+  return servers;
 };
 
 const getRelativePath = (file: any) => (file?.originFileObj?.webkitRelativePath || file?.webkitRelativePath || '') as string;
@@ -286,22 +341,49 @@ const getAccessId = async () => {
     );
 
     if (!response.ok) {
-      const msg = (data as any)?.message || '未能获取有效的 AccessId';
+      const msg = (data as any)?.message || '未能获取有效的 ID';
       throw new Error(msg);
     }
 
     if (!data?.data?.id) {
-      throw new Error('未能获取有效的 AccessId');
+      throw new Error('未能获取有效的 ID');
     }
 
     accessId.value = data.data.id;
-    message.success('AccessId 获取成功，请将链接分享给接收方');
+    message.success('ID 获取成功，请将 ID 发送给接收方');
     return accessId.value;
   } catch (error) {
     const msg = error instanceof Error ? error.message : '未知错误';
-    message.error(`获取 AccessId 失败: ${msg}`);
+    message.error(`获取 ID 失败: ${msg}`);
     throw error;
   }
+};
+
+const postSignal = async (payload: { role: 'sender' | 'receiver'; type: string; data: any; rid?: string }) => {
+  if (!accessId.value) {
+    throw new Error('ID 为空，无法发送信令');
+  }
+  await fetchWithRetry(
+    `/api/fileflow/${accessId.value}/signal`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+    { timeoutMs: 6000, retries: 2 },
+  );
+};
+
+const getSignals = async (role: 'sender' | 'receiver', since: number) => {
+  if (!accessId.value) {
+    throw new Error('ID 为空，无法获取信令');
+  }
+  const { data } = await fetchJsonWithRetry<{ success?: boolean; data?: { latest?: number; messages?: SignalMessage[] } }>(
+    `/api/fileflow/${accessId.value}/signal?role=${role}&since=${since}`,
+    { method: 'get' },
+    { timeoutMs: 6000, retries: 2 },
+  );
+  return data?.data || { latest: since, messages: [] };
 };
 
 const resetUpload = (by_error: boolean) => {
@@ -315,6 +397,179 @@ const resetUpload = (by_error: boolean) => {
   isFolderUpload.value = false;
   if (!by_error) {
     fileList.value = [];
+  }
+};
+
+const uploadViaP2P = async (nativeFile: File, config: P2pConfig) => {
+  const iceServers = buildIceServers(config);
+  if (iceServers.length === 0) {
+    return false;
+  }
+
+  let signalSeq = 0;
+  let pollActive = true;
+  let channelOpen = false;
+  let shouldCleanup = false;
+
+  const pc = new RTCPeerConnection({ iceServers });
+  const channel = pc.createDataChannel('file', { ordered: true });
+  channel.binaryType = 'arraybuffer';
+  channel.bufferedAmountLowThreshold = Math.max(64 * 1024, P2P_MAX_BUFFERED_AMOUNT / 2);
+
+  const cleanup = () => {
+    pollActive = false;
+    if (channel.readyState !== 'closed') {
+      channel.close();
+    }
+    pc.close();
+  };
+
+  const waitForChannelOpen = () =>
+    new Promise<void>((resolve, reject) => {
+      if (channel.readyState === 'open') {
+        channelOpen = true;
+        resolve();
+        return;
+      }
+      const timer = setTimeout(() => {
+        reject(new Error('P2P 连接超时'));
+      }, P2P_CONNECT_TIMEOUT_MS);
+
+      const handleOpen = () => {
+        channelOpen = true;
+        clearTimeout(timer);
+        channel.removeEventListener('open', handleOpen);
+        channel.removeEventListener('error', handleError);
+        resolve();
+      };
+      const handleError = () => {
+        clearTimeout(timer);
+        channel.removeEventListener('open', handleOpen);
+        channel.removeEventListener('error', handleError);
+        reject(new Error('P2P 连接失败'));
+      };
+
+      channel.addEventListener('open', handleOpen);
+      channel.addEventListener('error', handleError);
+    });
+
+  const waitForBufferLow = () =>
+    new Promise<void>((resolve) => {
+      if (channel.bufferedAmount < P2P_MAX_BUFFERED_AMOUNT) {
+        resolve();
+        return;
+      }
+      const handleLow = () => {
+        channel.removeEventListener('bufferedamountlow', handleLow);
+        resolve();
+      };
+      channel.addEventListener('bufferedamountlow', handleLow);
+    });
+
+  const handleSignal = async (msg: SignalMessage) => {
+    if (msg.msg_type === 'answer' && msg.data) {
+      const desc = new RTCSessionDescription(msg.data);
+      if (!pc.currentRemoteDescription) {
+        await pc.setRemoteDescription(desc);
+      }
+    } else if (msg.msg_type === 'candidate' && msg.data) {
+      try {
+        await pc.addIceCandidate(new RTCIceCandidate(msg.data));
+      } catch (error) {
+        console.warn('添加 ICE 候选失败', error);
+      }
+    } else if (msg.msg_type === 'fallback') {
+      throw new Error('接收方要求回退 HTTP');
+    }
+  };
+
+  pc.onicecandidate = (event) => {
+    if (event.candidate) {
+      void postSignal({ role: 'sender', type: 'candidate', data: event.candidate });
+    }
+  };
+
+  pc.onconnectionstatechange = () => {
+    if (['failed', 'disconnected', 'closed'].includes(pc.connectionState)) {
+      if (!channelOpen) {
+        channel.dispatchEvent(new Event('error'));
+      }
+    }
+  };
+
+  channel.addEventListener('message', (event) => {
+    if (typeof event.data === 'string') {
+      try {
+        const msg = JSON.parse(event.data);
+        if (msg?.type === 'done') {
+          message.success('接收方已完成 P2P 下载');
+        }
+      } catch {
+        return;
+      }
+    }
+  });
+
+  const pollSignals = async () => {
+    while (pollActive) {
+      try {
+        const signalData = await getSignals('sender', signalSeq);
+        signalSeq = signalData.latest ?? signalSeq;
+        for (const msg of signalData.messages || []) {
+          await handleSignal(msg);
+        }
+      } catch (error) {
+        console.warn('获取信令失败', error);
+      }
+      await sleep(P2P_SIGNAL_POLL_MS);
+    }
+  };
+
+  try {
+    void pollSignals();
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    await postSignal({ role: 'sender', type: 'offer', data: offer });
+
+    await waitForChannelOpen();
+
+    channel.send(JSON.stringify({ type: 'meta', name: nativeFile.name, size: nativeFile.size }));
+
+    const totalSize = nativeFile.size;
+    let offset = 0;
+    while (offset < totalSize) {
+      const chunk = nativeFile.slice(offset, offset + P2P_CHUNK_SIZE);
+      const buffer = await chunk.arrayBuffer();
+      channel.send(buffer);
+      offset += chunk.size;
+      uploadedLength.value = offset;
+      uploadProgress.value = Math.round((uploadedLength.value / totalSize) * 100);
+      await waitForBufferLow();
+    }
+
+    channel.send(JSON.stringify({ type: 'end' }));
+    pollActive = false;
+    setTimeout(() => {
+      if (channel.readyState !== 'closed') {
+        channel.close();
+      }
+      if (pc.connectionState !== 'closed') {
+        pc.close();
+      }
+    }, 5000);
+    return true;
+  } catch (error) {
+    try {
+      await postSignal({ role: 'sender', type: 'fallback', data: { message: error instanceof Error ? error.message : 'P2P 失败' } });
+    } catch {
+      // ignore signaling errors during fallback
+    }
+    shouldCleanup = true;
+    throw error;
+  } finally {
+    if (shouldCleanup) {
+      cleanup();
+    }
   }
 };
 
@@ -420,14 +675,28 @@ const handleUpload = async () => {
     };
 
     if (!accessId.value) {
-      message.error('AccessId 为空，无法建立连接');
+      message.error('ID 为空，无法建立连接');
       resetUpload(true);
       return;
     }
 
     uploadedLength.value = 0;
     uploadProgress.value = 0;
-    await uploadViaHttp();
+
+    const p2pConfig = await getP2pConfig();
+    if (hasP2pConfig(p2pConfig)) {
+      try {
+        message.warning('正在尝试 P2P 连接...');
+        await uploadViaP2P(nativeFile, p2pConfig);
+      } catch (error) {
+        message.warning('P2P 传输失败，已回退到 HTTP');
+        uploadedLength.value = 0;
+        uploadProgress.value = 0;
+        await uploadViaHttp();
+      }
+    } else {
+      await uploadViaHttp();
+    }
     uploadState.value = 'finished';
     message.success('文件上传成功！等待接收方下载完成...');
 
@@ -545,11 +814,11 @@ onUnmounted(() => {
 
         <div class="access-id-section">
           <div v-if="accessId" class="access-id-display">
-            <Text strong>分享链接:</Text>
+            <Text strong>接收 ID:</Text>
             <div class="link-container">
-              <Text>{{ `${HOST}/${accessId}/file` }}</Text>
+              <Text>{{ accessId }}</Text>
             </div>
-            <Text type="secondary">请将此链接发送给文件接收方</Text>
+            <Text type="secondary">请将此 ID 发送给文件接收方</Text>
           </div>
         </div>
 
@@ -563,7 +832,7 @@ onUnmounted(() => {
           <template #icon>
             <HardDrive />
           </template>
-          {{ uploadState === 'processing' ? '上传中...' : uploadState === 'pending' ? '等待对方接收' : '获取链接并上传' }}
+          {{ uploadState === 'processing' ? '上传中...' : uploadState === 'pending' ? '等待对方接收' : '获取 ID 并上传' }}
           </Button>
         </div>
 
@@ -576,8 +845,8 @@ onUnmounted(() => {
           <Title :level="5">使用说明:</Title>
           <ul>
             <li>选择或拖拽文件/文件夹；多个文件会自动打包</li>
-            <li>点击“获取链接并上传”，将生成的链接发给接收方</li>
-            <li>接收方打开链接后开始上传，过程中请保持此页开启</li>
+            <li>点击“获取 ID 并上传”，将生成的 ID 发给接收方</li>
+            <li>接收方在下载页输入 ID 后开始接收，过程中请保持此页开启</li>
           </ul>
         </div>
       </Space>

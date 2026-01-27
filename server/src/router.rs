@@ -4,7 +4,7 @@ use tower_http::timeout::TimeoutLayer;
 use tracing::{event, instrument, Level};
 use std::time::Duration;
 
-use crate::service::handler::{download, get_assets, get_file, get_id, get_status, upload, upload_file, done, home};
+use crate::service::handler::{*};
 use tower_http::services::ServeDir;
 
 fn api_router() -> Router {
@@ -15,7 +15,9 @@ fn api_router() -> Router {
             "Hi!"
         }))
         .route("/id", get(get_id))
+        .route("/p2p-config", get(get_p2p_config))
         .route("/{id}/status", get(get_status))
+        .route("/{id}/signal", get(get_signal).post(post_signal))
         // Add timeout layer specifically for upload api
         .route("/{id}/upload", post(upload_file))
         .layer(TimeoutLayer::new(Duration::from_secs(20)))
