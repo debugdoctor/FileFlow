@@ -16,7 +16,7 @@ use lazy_static::lazy_static;
 
 lazy_static! {
     static ref MAX_BLOCK_SIZE: u64 = read_env_u64("MAX_BLOCK_SIZE", 1024 * 1024);
-    static ref MAX_BLOCKS_PER_FILE: usize = read_env_usize("MAX_BLOCKS_PER_FILE", 1024);
+    static ref MAX_BLOCKS_PER_FILE: usize = read_env_usize("MAX_BLOCKS_PER_FILE", 10240);
 }
 
 /// TTL for metadata entries (seconds)
@@ -38,7 +38,7 @@ fn chunk_size() -> u64 {
 fn max_block_size() -> u64 {
     *MAX_BLOCK_SIZE
 }
-/// Maximum number of blocks allowed per file (default 1024, configurable via MAX_BLOCKS_PER_FILE)
+/// Maximum number of blocks allowed per file (default 10240, configurable via MAX_BLOCKS_PER_FILE)
 fn max_blocks_per_file() -> usize {
     *MAX_BLOCKS_PER_FILE
 }

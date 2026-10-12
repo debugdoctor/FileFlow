@@ -44,6 +44,9 @@ Stalled transfers expire after 10 minutes of cache inactivity (`BLOCK_TTL_SECS`)
 See `.env.example` for configuration. The browser reads the server's chunk size
 and file size limit automatically.
 
+The default per-file limit is 10GiB (10240 chunks of 1MiB). Change
+`MAX_BLOCKS_PER_FILE` to adjust it; this does not increase the server cache budget.
+
 The receiving browser still holds the file in memory until saving it. Retrying
 on the same download page reuses verified chunks; keep that page open because
 released server blocks cannot be recovered after a page reload. No server

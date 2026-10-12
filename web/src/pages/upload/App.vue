@@ -8,7 +8,7 @@ import { processUploadWithConcurrencyLimit } from '@/utils/asyncPool';
 import JSZip from 'jszip';
 
 let chunkSize = 1024 * 1024;
-let maxTotalSize = chunkSize * 1024;
+let maxTotalSize = chunkSize * 10240;
 const P2P_CHUNK_SIZE = 16 * 1024;
 const P2P_MAX_BUFFERED_AMOUNT = 8 * 1024 * 1024;
 const P2P_CONNECT_TIMEOUT_MS = 15000;
