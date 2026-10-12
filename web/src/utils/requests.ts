@@ -1,5 +1,6 @@
 import message from "ant-design-vue/es/message";
 import type { Ref } from "vue";
+import { fetchWithTimeout } from './http';
 
 const MAX_RETRIES = 4;
 const BASE_DELAY_MS = 400;
@@ -12,19 +13,10 @@ const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 const isRetryableStatus = (status: number) =>
   status === 408 || status === 425 || status === 429 || (status >= 500 && status <= 599);
 
-const fetchWithTimeout = async (input: RequestInfo, init: RequestInit, timeoutMs: number): Promise<Response> => {
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    return await fetch(input, { ...init, signal: controller.signal });
-  } finally {
-    clearTimeout(timeoutId);
-  }
-};
-
 const parseJsonSafely = async <T>(response: Response): Promise<T | null> => {
+  const text = await response.text();
   try {
-    return (await response.json()) as T;
+    return JSON.parse(text) as T;
   } catch {
     return null;
   }
@@ -41,7 +33,7 @@ interface RetryOptions {
   retryOnStatus?: (status?: number) => boolean;
 }
 
-export const fetchWithRetry = async (
+const fetchAndConsumeWithRetry = async <T>(
   input: RequestInfo,
   init: RequestInit = {},
   {
@@ -52,17 +44,18 @@ export const fetchWithRetry = async (
     jitterMs = 150,
     retryOnStatus = shouldRetry,
   }: RetryOptions = {},
-): Promise<Response> => {
+  consume: (response: Response) => Promise<T>,
+): Promise<T> => {
   let attempt = 0;
   let lastError: unknown;
 
   while (attempt <= retries) {
     try {
-      const response = await fetchWithTimeout(input, init, timeoutMs);
-      if (response.ok || !retryOnStatus(response.status)) {
-        return response;
-      }
-      lastError = new Error(`Request failed with status ${response.status}`);
+      return await fetchWithTimeout(input, init, timeoutMs, async response => {
+        if (response.ok || !retryOnStatus(response.status)) return await consume(response);
+        await response.body?.cancel();
+        throw new Error(`Request failed with status ${response.status}`);
+      });
     } catch (error) {
       lastError = error;
       // AbortError usually means timeout; keep retrying unless we exhausted attempts.
@@ -82,40 +75,39 @@ export const fetchWithRetry = async (
   throw lastError instanceof Error ? lastError : new Error("Request failed after retries");
 };
 
+export const fetchWithRetry = (
+  input: RequestInfo, init: RequestInit = {}, options: RetryOptions = {},
+): Promise<Response> => fetchAndConsumeWithRetry(input, init, options, async response => response);
+
 export const fetchJsonWithRetry = async <T>(
   input: RequestInfo,
   init: RequestInit = {},
   options?: RetryOptions,
 ): Promise<{ data: T | null; response: Response }> => {
-  const response = await fetchWithRetry(input, init, options);
-  const data = await parseJsonSafely<T>(response);
-  return { data, response };
+  return fetchAndConsumeWithRetry(input, init, options, async response => ({
+    data: await parseJsonSafely<T>(response), response,
+  }));
 };
 
 export const uploadFile = async (formData: FormData, accessId: string | null, i: number, seq_len: number): Promise<number> => {
   let attempt = 0;
+  const capacityDeadline = Date.now() + 120000;
 
   while (attempt <= MAX_RETRIES) {
     try {
-      const response = await fetchWithTimeout(
+      const { response, body } = await fetchWithTimeout(
         `/api/fileflow/${accessId}/upload`,
         { method: "post", body: formData },
-        18000
+        18000,
+        async response => ({ response, body: await response.json() as { code?: number; message?: string } }),
       );
-
-      let body: any = null;
-      let messageFromServer: string | undefined;
-      try {
-        body = await response.json();
-        messageFromServer = body?.message;
-      } catch {
-        if (!response.ok) {
-          throw new Error(`Upload failed for chunk ${i + 1} with status ${response.status}`);
-        }
+      if (response.status === 429 && Date.now() < capacityDeadline) {
+        await sleep(1000);
+        continue; // Cache backpressure is not a failed upload attempt.
       }
 
       if (!response.ok || (body && body.code !== 200)) {
-        const err = new Error(messageFromServer || `Upload failed for chunk ${i + 1} with status ${response.status}`);
+        const err = new Error(body?.message || `Upload failed for chunk ${i + 1} with status ${response.status}`);
         (err as any).status = response.status;
         throw err;
       }
@@ -141,41 +133,49 @@ export const uploadFile = async (formData: FormData, accessId: string | null, i:
   throw new Error(`Upload failed for chunk ${i + 1} after ${MAX_RETRIES} retries`);
 };
 
-export const downloadFile = async (fileId: string, start: number, fileName: Ref<string>): Promise<[RegExpMatchArray, Response]> => {
+export const downloadFile = async (
+  fileId: string, start: number, fileName: Ref<string>, total: number, length: number,
+): Promise<[RegExpMatchArray, ArrayBuffer]> => {
   let attempt = 0;
 
   while (attempt <= MAX_RETRIES) {
     try {
-      const response = await fetchWithTimeout(
+      return await fetchWithTimeout(
         `/api/fileflow/${fileId}/file?rid=${localStorage.getItem("rid")}&start=${start}`,
         { method: "get" },
-        18000
+        18000,
+        async (response): Promise<[RegExpMatchArray, ArrayBuffer]> => {
+          if (response.status !== 206) {
+            await response.body?.cancel();
+            const err = new Error(`Download failed with status ${response.status}`);
+            (err as any).status = response.status;
+            throw err;
+          }
+
+          const contentRange = response.headers.get("Content-Range");
+          const contentName = response.headers.get("Content-Name");
+          if (contentName) {
+            try {
+              fileName.value = decodeURIComponent(contentName);
+            } catch {
+              fileName.value = contentName;
+            }
+          }
+
+          if (contentRange) {
+            const rangeMatch = contentRange.match(/^bytes\s+(\d+)-(\d+)\/(\d+)$/);
+            if (rangeMatch && Number(rangeMatch[1]) === start && Number(rangeMatch[2]) === start + length - 1
+                && Number(rangeMatch[3]) === total) {
+              const buffer = await response.arrayBuffer();
+              if (buffer.byteLength !== length) throw new Error('Incomplete file block');
+              return [rangeMatch, buffer];
+            }
+          }
+
+          await response.body?.cancel();
+          throw new Error("Invalid Content-Range");
+        },
       );
-
-      if (!response.ok) {
-        const err = new Error(`Download failed with status ${response.status}`);
-        (err as any).status = response.status;
-        throw err;
-      }
-
-      const contentRange = response.headers.get("Content-Range");
-      const contentName = response.headers.get("Content-Name");
-      if (contentName) {
-        try {
-          fileName.value = decodeURIComponent(contentName);
-        } catch {
-          fileName.value = contentName;
-        }
-      }
-
-      if (contentRange) {
-        const rangeMatch = contentRange.match(/bytes\s+(\d+)-(\d+)\/(\d+)/);
-        if (rangeMatch) {
-          return [rangeMatch, response];
-        }
-      }
-
-      throw new Error("Invalid Content-Range");
     } catch (error: unknown) {
       attempt += 1;
       const status = (error as any)?.status as number | undefined;
@@ -192,4 +192,26 @@ export const downloadFile = async (fileId: string, start: number, fileName: Ref<
   }
 
   throw new Error(`Download failed for chunk ${start} after ${MAX_RETRIES} retries`);
+};
+
+export const acknowledgeBlock = async (fileId: string, start: number): Promise<void> => {
+  const { data, response } = await fetchJsonWithRetry<{ success?: boolean }>(
+    `/api/fileflow/${fileId}/ack`,
+    { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ rid: localStorage.getItem('rid'), start }) },
+    { timeoutMs: 6000, retries: 4 },
+  );
+  if (!response.ok || !data?.success) throw new Error('无法确认文件分块，请重试');
+};
+
+export const getTransferConfig = async (): Promise<{ chunk_size: number; max_file_size: number }> => {
+  const { data, response } = await fetchJsonWithRetry<{
+    success?: boolean; data?: { chunk_size: number; max_file_size: number };
+  }>('/api/fileflow/config');
+  if (!response.ok || !data?.success || !data.data
+      || !Number.isSafeInteger(data.data.chunk_size) || data.data.chunk_size <= 0
+      || !Number.isSafeInteger(data.data.max_file_size) || data.data.max_file_size <= 0) {
+    throw new Error('无法获取文件传输配置');
+  }
+  return data.data;
 };

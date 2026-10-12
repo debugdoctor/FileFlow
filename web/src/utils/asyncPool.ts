@@ -34,9 +34,9 @@ export const processUploadWithConcurrencyLimit = (
 ): Promise<void> => processWithConcurrencyLimit(tasks, limit, onProgress);
 
 export const processDownloadWithConcurrencyLimit = (
-  tasks: Array<() => Promise<[RegExpMatchArray, Response]>>,
+  tasks: Array<() => Promise<[RegExpMatchArray, ArrayBuffer]>>,
   limit: number,
-  onProgress?: (range: RegExpMatchArray, response: Response) => void | Promise<void>,
+  onProgress?: (range: RegExpMatchArray, data: ArrayBuffer) => void | Promise<void>,
 ): Promise<void> => processWithConcurrencyLimit(
   tasks,
   limit,

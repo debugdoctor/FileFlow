@@ -15,11 +15,13 @@ fn api_router() -> Router {
             "Hi!"
         }))
         .route("/id", get(get_id))
+        .route("/config", get(get_transfer_config))
         .route("/p2p-config", get(get_p2p_config))
         .route("/{id}/status", get(get_status))
         .route("/{id}/signal", get(get_signal).post(post_signal))
         // Add timeout layer specifically for upload api
         .route("/{id}/upload", post(upload_file))
+        .route("/{id}/ack", post(acknowledge_block))
         .layer(TimeoutLayer::new(Duration::from_secs(20)))
         // Add timeout layer specifically for download api
         .route("/{id}/file", get(get_file))

@@ -17,7 +17,7 @@ use lazy_static::lazy_static;
 lazy_static! {
     static ref MAX_BLOCK_SIZE: u64 = read_env_u64("MAX_BLOCK_SIZE", 1024 * 1024);
     static ref MAX_BLOCKS_PER_FILE: usize = read_env_usize("MAX_BLOCKS_PER_FILE", 1024);
-    static ref BLOCK_TTL_SECS: u64 = read_env_u64("BLOCK_TTL_SECS", 600);
+    static ref UPLOAD_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::new(4);
 }
 
 /// TTL for metadata entries (seconds)
@@ -30,7 +30,10 @@ const BLOCK_FETCH_RETRY_INTERVAL: u64 = 250;
 
 /// Aggregate file size limit derived from block constraints
 fn max_total_size() -> u64 {
-    max_block_size().saturating_mul(max_blocks_per_file() as u64)
+    chunk_size().saturating_mul(max_blocks_per_file() as u64)
+}
+fn chunk_size() -> u64 {
+    max_block_size().min(1024 * 1024)
 }
 /// Maximum size of each file block in bytes (default 1MB, configurable via MAX_BLOCK_SIZE)
 fn max_block_size() -> u64 {
@@ -119,6 +122,38 @@ pub struct SignalPostPayload {
 pub struct SignalQuery {
     pub role: String,
     pub since: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BlockAck {
+    pub rid: String,
+    pub start: u64,
+}
+
+pub async fn get_transfer_config() -> impl IntoResponse {
+    let cache = FileBlock::get_db();
+    Json(json!({
+        "success": true,
+        "data": {
+            "chunk_size": chunk_size(),
+            "max_file_size": max_total_size(),
+            "cache_bytes": cache.max_bytes,
+            "window_bytes": cache.window_bytes,
+        }
+    }))
+}
+
+pub async fn acknowledge_block(Path(id): Path<String>, Json(ack): Json<BlockAck>) -> impl IntoResponse {
+    let Some(meta) = MetaInfo::get_db().get(&id).await else {
+        return (StatusCode::NOT_FOUND, Json(json!({"success": false, "message": "Access ID Not Found"}))).into_response();
+    };
+    if ack.rid.is_empty() || meta.value.used_by != ack.rid {
+        return (StatusCode::BAD_REQUEST, Json(json!({"success": false, "message": "Wrong Receive ID"}))).into_response();
+    }
+    match FileBlock::get_db().acknowledge(&id, ack.start).await {
+        Ok(()) => Json(json!({"success": true})).into_response(),
+        Err(message) => (StatusCode::NOT_FOUND, Json(json!({"success": false, "message": message}))).into_response(),
+    }
 }
 
 
@@ -357,7 +392,8 @@ pub async fn get_id(
     // Changed from INFO to DEBUG to reduce log verbosity
     event!(Level::DEBUG, "Generating new ID for file '{}' with size {}", file_name, file_size);
 
-    let meta_info = MetaInfo::new(file_name, file_size);
+    let mut meta_info = MetaInfo::new(file_name, file_size);
+    meta_info.block_size = chunk_size() as u32;
 
     match MetaInfo::get_db().insert(&id, meta_info, META_TTL_SECS).await {
         Ok(_) => {
@@ -407,6 +443,7 @@ pub async fn get_status(Path(id): Path<String>) -> impl IntoResponse {
                     "data": {
                         "file_name": meta_info.value.file_name,
                         "file_size": meta_info.value.file_size,
+                        "chunk_size": meta_info.value.block_size,
                         "is_using": meta_info.value.is_using,
                         "done": meta_info.value.done,
                     }
@@ -487,9 +524,9 @@ pub async fn get_file(
     let mut retries = 0;
     
     let (block_name, block_data, block_start, block_end, block_total) = loop {
-        match FileBlock::get_db().get(&format!("{}:{:012}", &id, start)).await {
+        match FileBlock::get_db().get(&id, start).await {
             Some(file_block) => {
-                if file_block.value.start > start {
+                if file_block.start > start {
                     event!(Level::WARN, "Wrong start position for ID: {} and start: {}", id.clone(), start);
                     return (
                     StatusCode::BAD_REQUEST,
@@ -502,7 +539,7 @@ pub async fn get_file(
                 }
                 // Changed from DEBUG to TRACE to reduce log verbosity
                 event!(Level::TRACE, "Retrieved block for ID: {} and start: {}", id.clone(), start);
-                break (file_block.value.filename, file_block.value.data, file_block.value.start, file_block.value.end, file_block.value.total);
+                break (file_block.filename, file_block.data, file_block.start, file_block.end, file_block.total);
             },
             None => {
                 if retries >= BLOCK_FETCH_MAX_RETRIES {
@@ -547,15 +584,18 @@ pub async fn get_file(
 /// Includes validation for block size and file limits
 #[instrument]
 pub async fn upload_file(Path(id): Path<String>, multipart: Multipart) -> impl IntoResponse {
+    // Bound multipart buffers as well as cached payloads.
+    let _slot = UPLOAD_SLOTS.acquire().await.unwrap();
     // Changed from INFO to DEBUG to reduce log verbosity for large files
     event!(Level::DEBUG, "Starting file upload for ID: {}", id);
     
     // Allow upload even if receiver hasn't connected yet; only require a valid ID.
-    match MetaInfo::get_db().get(&id).await {
+    let metadata = match MetaInfo::get_db().get(&id).await {
         Some(meta_info) => {
             if !meta_info.value.is_using {
                 event!(Level::DEBUG, "Receiver not connected yet for ID: {}", id);
             }
+            meta_info.value
         },
         None => {
             event!(Level::WARN, "Missing Access ID: {}", id);
@@ -672,6 +712,13 @@ pub async fn upload_file(Path(id): Path<String>, multipart: Multipart) -> impl I
         start = info.start;
         end = info.end;
         total = info.total;
+
+        if total != metadata.file_size || start % metadata.block_size as u64 != 0
+            || end != start.saturating_add(metadata.block_size as u64).min(total).saturating_sub(1) {
+            return (StatusCode::BAD_REQUEST, Json(json!({
+                "code": 400, "success": false, "message": "Block range does not match transfer metadata"
+            }))).into_response();
+        }
 
         if end < start || total == 0 || start >= total || end >= total {
             event!(Level::WARN, "Invalid range in info part: start={}, end={}, total={}", start, end, total);
@@ -803,33 +850,6 @@ pub async fn upload_file(Path(id): Path<String>, multipart: Multipart) -> impl I
             )
             .into_response();
         }
-        // Check if meet the max blocks per file in cache
-        let file_block_db = FileBlock::get_db();
-        let mut block_count = 0;
-        let prefix = format!("{}:", id);
-        let mut store = file_block_db.store.write().await;
-        let block_key = format!("{}:{:012}", &id, start);
-        
-        for key in store.keys() {
-            if key.starts_with(&prefix) {
-                block_count += 1;
-            }
-
-            if block_count >= max_blocks_per_file() {
-                break;
-            }
-        }
-        if block_count >= max_blocks_per_file() && !store.contains_key(&block_key) {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({
-                      "code": 400,
-                      "success": false,
-                      "message": format!("Maximum number of blocks per file reached ({})", max_blocks_per_file())
-                }))
-            )
-            .into_response();
-        }
 
         let file_block = FileBlock::new(
             &data,
@@ -839,10 +859,13 @@ pub async fn upload_file(Path(id): Path<String>, multipart: Multipart) -> impl I
             total,
         );
 
-        store.insert(block_key, CacheEntry {
-            value: file_block,
-            exp: Instant::now() + std::time::Duration::from_secs(*BLOCK_TTL_SECS),
-        });
+        if !metadata.done && !FileBlock::get_db().insert(&id, file_block).await {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                AppendHeaders([("Retry-After", "1")]),
+                Json(json!({"code": 429, "success": false, "message": "Waiting for receiver or available RAM"})),
+            ).into_response();
+        }
         event!(Level::DEBUG, "Successfully uploaded block for '{}' range {}-{} of total {} for ID: {}", filename, start, end, total, id);
     }
 
@@ -864,8 +887,7 @@ pub async fn done(Path(id): Path<String>, Json(_payload): Json<serde_json::Value
             meta_info.value.done = true;
             match MetaInfo::get_db().update(&id, meta_info.value, meta_info.exp).await {
                 Ok(_) => {
-                    let prefix = format!("{}:", id);
-                    FileBlock::get_db().store.write().await.retain(|key, _| !key.starts_with(&prefix));
+                    FileBlock::get_db().finish(&id).await;
                     event!(Level::DEBUG, "Download marked as complete for ID: {}", id);
                     (
                         StatusCode::OK,
@@ -932,8 +954,8 @@ mod tests {
     async fn downloaded_blocks_remain_retryable_until_done() {
         let id = "test-retry-block";
         MetaInfo::get_db().insert(id, MetaInfo::new("中文 & test.txt".into(), 4), 60).await.unwrap();
-        FileBlock::get_db().insert(&format!("{}:{:012}", id, 0),
-            FileBlock::new(&Bytes::from_static(b"test"), "中文 & test.txt".into(), 0, 3, 4), 60).await.unwrap();
+        assert!(FileBlock::get_db().insert(id,
+            FileBlock::new(&Bytes::from_static(b"test"), "中文 & test.txt".into(), 0, 3, 4)).await);
         let query = HashMap::from([("rid".into(), "receiver".into()), ("start".into(), "0".into())]);
         for _ in 0..2 {
             let response = get_file(Path(id.into()), Query(query.clone())).await.into_response();
@@ -943,7 +965,7 @@ mod tests {
         }
         let response = done(Path(id.into()), Json(json!({}))).await.into_response();
         assert_eq!(response.status(), StatusCode::OK);
-        assert!(FileBlock::get_db().get(&format!("{}:{:012}", id, 0)).await.is_none());
+        assert!(FileBlock::get_db().get(id, 0).await.is_none());
     }
 
     #[tokio::test]
@@ -976,5 +998,22 @@ mod tests {
         assert_ne!(first.is_ok(), second.is_ok());
         let winner = if first.is_ok() { "first" } else { "second" };
         assert!(MetaInfo::claim(id, winner).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn acknowledgements_are_receiver_bound_and_idempotent() {
+        let id = "test-block-ack";
+        MetaInfo::get_db().insert(id, MetaInfo::new("test".into(), 4), 60).await.unwrap();
+        MetaInfo::claim(id, "receiver").await.unwrap();
+        assert!(FileBlock::get_db().insert(id,
+            FileBlock::new(&Bytes::from_static(b"test"), "test".into(), 0, 3, 4)).await);
+        let wrong = acknowledge_block(Path(id.into()), Json(BlockAck { rid: "wrong".into(), start: 0 })).await.into_response();
+        assert_eq!(wrong.status(), StatusCode::BAD_REQUEST);
+        assert!(FileBlock::get_db().get(id, 0).await.is_some());
+        for _ in 0..2 {
+            let response = acknowledge_block(Path(id.into()), Json(BlockAck { rid: "receiver".into(), start: 0 })).await.into_response();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        assert!(FileBlock::get_db().get(id, 0).await.is_none());
     }
 }

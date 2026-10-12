@@ -2,7 +2,7 @@
 import { ref, onMounted, nextTick } from 'vue';
 import { Button, Progress, message, Card, Typography, Space } from 'ant-design-vue';
 import { Download, FileText, HardDrive } from 'lucide-vue-next';
-import { downloadFile, fetchJsonWithRetry, fetchWithRetry } from '@/utils/requests';
+import { downloadFile, acknowledgeBlock, fetchJsonWithRetry, fetchWithRetry } from '@/utils/requests';
 import { processDownloadWithConcurrencyLimit } from '@/utils/asyncPool';
 
 const { Title, Text } = Typography;
@@ -16,6 +16,10 @@ const requiresCode = ref(false);
 const codeDigits = ref<string[]>(['', '', '', '', '']);
 const codeInputs = ref<Array<HTMLInputElement | null>>([]);
 const activeFileId = ref<string | null>(null);
+let chunkSize = 1024 * 1024;
+// Preserve verified chunks across button retries after their server copies are released.
+const fileData = new Map<number, ArrayBuffer>();
+const pendingAcks = new Set<number>();
 
 const P2P_MAX_BUFFERED_AMOUNT = 8 * 1024 * 1024;
 const P2P_CONNECT_TIMEOUT_MS = 15000;
@@ -223,6 +227,7 @@ const downloadViaP2P = async (config: P2pConfig) => {
     a.download = incomingName || 'downloaded_file';
     document.body.appendChild(a);
     a.click();
+    chunks.length = 0;
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
 
@@ -428,57 +433,62 @@ const handleGetFile = async () => {
   downloadProgress.value = 0;
 
   let start = 0;
-  let fileData: Map<number, Uint8Array> = new Map();
-  let downloadedBytes = 0;
+  let downloadedBytes = Array.from(fileData.values()).reduce((total, data) => total + data.byteLength, 0);
+  downloadProgress.value = fileSize.value > 0 ? Math.round(downloadedBytes / fileSize.value * 100) : 0;
 
   const fileId = activeFileId.value;
 
   const downloadViaHttp = async () => {
     // Create an array to hold all chunk download promises
-    const downloadPromises: Array<() => Promise<any>> = [];
+    const downloadPromises: Array<() => Promise<[RegExpMatchArray, ArrayBuffer]>> = [];
 
-    // Add chunks to download (in 1MB chunks)
+    // An acknowledgement may have failed after the body was already verified.
+    for (const savedStart of pendingAcks) {
+      await acknowledgeBlock(fileId, savedStart);
+      pendingAcks.delete(savedStart);
+    }
+
+    // Use the chunk size recorded by the server for this transfer.
     while (start < fileSize.value) {
-      const chunkEnd = Math.min(start + 1024 * 1024, fileSize.value) - 1;
+      const chunkEnd = Math.min(start + chunkSize, fileSize.value) - 1;
       const currentStart = start; // 保存当前start值的快照
 
       // Create a function that returns a promise for this chunk download
       // Pass fileId and the byte range start, but not fileName since it's not needed for the request
-      downloadPromises.push(() => downloadFile(fileId, currentStart, fileName));
+      if (!fileData.has(currentStart)) {
+        downloadPromises.push(() => downloadFile(fileId, currentStart, fileName, fileSize.value, chunkEnd - currentStart + 1));
+      }
 
       if (chunkEnd === fileSize.value - 1) break;
-      start += 1024 * 1024;
+      start += chunkSize;
     }
 
     // Process downloads with a concurrency limit of 4
     try {
-      await processDownloadWithConcurrencyLimit(downloadPromises, 4, async (rangeMatch: RegExpMatchArray, response: Response) => {
+      await processDownloadWithConcurrencyLimit(downloadPromises, 4, async (rangeMatch: RegExpMatchArray, data: ArrayBuffer) => {
         const rangeStart = parseInt(rangeMatch[1]);
 
-        // Get the file data
-        const data = await response.arrayBuffer();
-        const chunk = new Uint8Array(data);
-        fileData.set(rangeStart, chunk);
+        fileData.set(rangeStart, data);
+        pendingAcks.add(rangeStart);
 
         // Update progress - 累加当前chunk的大小而不是重新计算所有chunks
-        downloadedBytes += chunk.length;
+        downloadedBytes += data.byteLength;
 
         // Only update progress if we have a valid totalSize
         if (fileSize.value > 0) {
           downloadProgress.value = Math.round((downloadedBytes / fileSize.value) * 100);
         }
+        await acknowledgeBlock(fileId, rangeStart);
+        pendingAcks.delete(rangeStart);
       });
     } catch (error) {
       throw new Error('下载过程中发生错误: ' + (error instanceof Error ? error.message : '未知错误'));
     }
 
-    await new Promise<void>(resolve => { setTimeout(resolve, 500)});
-
     // Combine all chunks and save the file
     if (fileData.size > 0) {
       try {
-        // Combine all Uint8Array chunks into a single Uint8Array
-        const combinedData = new Uint8Array(fileSize.value);
+        // Check continuity without allocating another file-sized buffer.
         let offset = 0;
         const sortedChunks = Array.from(fileData.entries()).sort((a, b) => a[0] - b[0]);
 
@@ -486,13 +496,12 @@ const handleGetFile = async () => {
           if (start !== offset) {
             throw new Error(`文件 ${fileName.value} 中有缺失的块，请重试`);
           }
-          combinedData.set(chunk, offset);
-          offset += chunk.length;
+          offset += chunk.byteLength;
         }
         if (offset !== fileSize.value) throw new Error('文件大小不完整，请重试');
 
-        // Create a Blob from the combined data
-        const blob = new Blob([combinedData], { type: 'application/octet-stream' });
+        // Build the Blob directly from verified blocks.
+        const blob = new Blob(sortedChunks.map(([, data]) => data), { type: 'application/octet-stream' });
 
         // Create a download link and trigger the download
         const url = URL.createObjectURL(blob);
@@ -501,6 +510,8 @@ const handleGetFile = async () => {
         a.download = fileName.value || 'downloaded_file';
         document.body.appendChild(a);
         a.click();
+        fileData.clear();
+        sortedChunks.length = 0;
 
         // Clean up
         document.body.removeChild(a);
@@ -548,7 +559,7 @@ const handleGetFile = async () => {
     return;
   }
 
-  const p2pConfig = await getP2pConfig();
+  const p2pConfig = fileData.size === 0 ? await getP2pConfig() : {};
   if (hasP2pConfig(p2pConfig)) {
     try {
       message.warning('正在尝试 P2P 连接...');
@@ -590,7 +601,7 @@ onMounted(async () => {
 
   // Get the file info from status API
   try {
-    const { data: statusData, response } = await fetchJsonWithRetry<{ success?: boolean; data?: { file_name?: string; file_size?: number; } }>(
+    const { data: statusData, response } = await fetchJsonWithRetry<{ success?: boolean; data?: { file_name?: string; file_size?: number; chunk_size?: number; } }>(
       `/api/fileflow/${activeFileId.value}/status`,
       { method: 'get' },
       { timeoutMs: 8000, retries: 2 },
@@ -606,6 +617,7 @@ onMounted(async () => {
     const fileInfo = statusData.data;
     fileName.value = fileInfo.file_name || '未知文件';
     fileSize.value = fileInfo.file_size || 0;
+    chunkSize = fileInfo.chunk_size || chunkSize;
 
   } catch (error: unknown) {
     message.error(`获取文件信息失败: ${(error as Error).message}`);

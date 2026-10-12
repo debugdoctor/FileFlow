@@ -1,5 +1,6 @@
 use std::{sync::Arc};
 use super::memdb::MemDB;
+use super::block_cache::BlockCache;
 
 use axum::body::Bytes;
 use lazy_static::lazy_static;
@@ -10,7 +11,6 @@ use serde_json::Value;
 pub struct MetaInfo {
     pub is_using: bool,
     pub used_by: String, // a random id gen by client
-    #[allow(dead_code)]
     pub block_size: u32,
     pub file_name: String,
     pub file_size: u64,
@@ -64,7 +64,7 @@ pub struct FileBlock {
 }
 
 impl FileBlock {
-    pub fn get_db() -> Arc<MemDB<FileBlock>> {
+    pub fn get_db() -> Arc<BlockCache> {
         FILE_BLOCK_DB.clone()
     }
 
@@ -113,7 +113,7 @@ lazy_static!{
 }
 
 lazy_static!{
-    pub static ref FILE_BLOCK_DB: Arc<MemDB<FileBlock>> = Arc::new(MemDB::new());
+    pub static ref FILE_BLOCK_DB: Arc<BlockCache> = Arc::new(BlockCache::from_env());
 }
 
 lazy_static!{

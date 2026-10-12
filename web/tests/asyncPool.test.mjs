@@ -29,17 +29,17 @@ test('a failed request rejects after draining active workers', { timeout: 1000 }
   assert.equal(extraStarted, false);
 });
 
-test('response-body processing obeys the concurrency limit', { timeout: 1000 }, async () => {
+test('chunk processing obeys the concurrency limit', { timeout: 1000 }, async () => {
   let active = 0;
   let peak = 0;
   let processed = 0;
   await processDownloadWithConcurrencyLimit(Array.from({ length: 8 }, () => async () => {
     active++;
     peak = Math.max(peak, active);
-    return [null, new Response('chunk')];
-  }), 2, async (_, response) => {
+    return [null, new TextEncoder().encode('chunk').buffer];
+  }), 2, async (_, data) => {
     await delay(5);
-    assert.equal(await response.text(), 'chunk');
+    assert.equal(new TextDecoder().decode(data), 'chunk');
     active--;
     processed++;
   });
@@ -47,8 +47,8 @@ test('response-body processing obeys the concurrency limit', { timeout: 1000 }, 
   assert.equal(processed, 8);
 });
 
-test('response-body failure propagates to the caller', { timeout: 1000 }, async () => {
+test('chunk acknowledgement failure propagates to the caller', { timeout: 1000 }, async () => {
   await assert.rejects(processDownloadWithConcurrencyLimit([
-    async () => [null, new Response('chunk')],
-  ], 1, async () => { throw new Error('truncated response'); }), /truncated response/);
+    async () => [null, new ArrayBuffer(1)],
+  ], 1, async () => { throw new Error('acknowledgement failed'); }), /acknowledgement failed/);
 });

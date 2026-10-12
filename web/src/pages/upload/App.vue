@@ -3,12 +3,12 @@ import { onMounted, onUnmounted, ref } from 'vue';
 import { Upload as UploadIcon, FileText, HardDrive, X } from 'lucide-vue-next';
 import { message, Button, Upload, Progress, Card, Typography, Space, Alert } from 'ant-design-vue';
 import type { UploadProps } from 'ant-design-vue';
-import { uploadFile, fetchJsonWithRetry, fetchWithRetry } from '@/utils/requests';
+import { uploadFile, fetchJsonWithRetry, fetchWithRetry, getTransferConfig } from '@/utils/requests';
 import { processUploadWithConcurrencyLimit } from '@/utils/asyncPool';
 import JSZip from 'jszip';
 
-const CHUNK_SIZE = 1024 * 1024;
-const MAX_TOTAL_SIZE = CHUNK_SIZE * 1024; // keep in sync with server limits (1GB)
+let chunkSize = 1024 * 1024;
+let maxTotalSize = chunkSize * 1024;
 const P2P_CHUNK_SIZE = 16 * 1024;
 const P2P_MAX_BUFFERED_AMOUNT = 8 * 1024 * 1024;
 const P2P_CONNECT_TIMEOUT_MS = 15000;
@@ -325,6 +325,9 @@ const getAccessId = async () => {
   }
 
   try {
+    const config = await getTransferConfig();
+    chunkSize = config.chunk_size;
+    maxTotalSize = config.max_file_size;
     const fileToUpload = (isFolderUpload.value ? zipFile.value : fileList.value?.[0]) as File | undefined;
     if (!fileToUpload) {
       message.error('没有可上传的文件');
@@ -337,8 +340,8 @@ const getAccessId = async () => {
       return;
     }
 
-    if (fileSize > MAX_TOTAL_SIZE) {
-      message.error('文件过大，单次上传上限为 1GB');
+    if (fileSize > maxTotalSize) {
+      message.error(`文件过大，单次上传上限为 ${formatBytes(maxTotalSize)}`);
       return;
     }
     const { data, response } = await fetchJsonWithRetry<{ success?: boolean; data?: { id: string } }>(
@@ -672,34 +675,32 @@ const handleUpload = async () => {
 
     const uploadViaHttp = async () => {
       // Calculate number of chunks
-      const chunks = Math.ceil(fileSize / CHUNK_SIZE);
+      const chunks = Math.ceil(fileSize / chunkSize);
 
       message.info(`开始上传${isFolderUpload.value ? '压缩' : ''}文件: ${fileName} (${formatBytes(fileSize)})`);
 
       // Create an array to hold all chunk upload promises
-      const uploadPromises: Array<() => Promise<any>> = [];
+      const uploadPromises: Array<() => Promise<number>> = [];
 
       // Create all chunk upload functions
       for (let i = 0; i < chunks; i++) {
-        const start = i * CHUNK_SIZE;
-        const end = Math.min(start + CHUNK_SIZE, fileSize);
+        const start = i * chunkSize;
+        const end = Math.min(start + chunkSize, fileSize);
         const chunkIndex = i; // 保存当前索引的快照
 
-        // Slice the file
-        const chunk = nativeFile.slice(start, end);
-
-        // Prepare form data
-        const formData = new FormData();
-        formData.append('info', JSON.stringify({
-          filename: fileName,
-          start: start,
-          end: end - 1,
-          total: fileSize,
-        } as UploadInfo));
-        formData.append('file', chunk);
-
-        // Create a function that returns a promise for this chunk upload
-        uploadPromises.push(() => uploadFile(formData, accessId.value, chunkIndex, chunk.size));
+        // Allocate multipart data only when a worker can actually send it.
+        uploadPromises.push(() => {
+          const chunk = nativeFile.slice(start, end);
+          const formData = new FormData();
+          formData.append('info', JSON.stringify({
+            filename: fileName,
+            start: start,
+            end: end - 1,
+            total: fileSize,
+          } as UploadInfo));
+          formData.append('file', chunk);
+          return uploadFile(formData, accessId.value, chunkIndex, chunk.size);
+        });
       }
 
       // Process uploads with a concurrency limit of 4
