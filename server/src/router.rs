@@ -21,7 +21,7 @@ fn api_router() -> Router {
         .route("/{id}/signal", get(get_signal).post(post_signal))
         // Add timeout layer specifically for upload api
         .route("/{id}/admit", post(admit_upload).layer(DefaultBodyLimit::max(4096)))
-        .route("/{id}/upload", post(upload_file).layer(DefaultBodyLimit::max(1024 * 1024 + 16384)))
+        .route("/{id}/upload", post(upload_file).layer(DefaultBodyLimit::max(2 * 1024 * 1024 + 16384)))
         .route("/{id}/ack", post(acknowledge_block))
         .layer(TimeoutLayer::new(Duration::from_secs(20)))
         // Add timeout layer specifically for download api

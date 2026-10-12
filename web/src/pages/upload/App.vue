@@ -76,10 +76,11 @@ const uploadProgress = ref(0);
 const receiverWaitMinutes = ref(5);
 const selectedChunkSize = ref(1024 * 1024);
 const uploadConcurrency = ref(4);
-const serverChunkLimit = ref(1024 * 1024);
+const serverChunkLimit = ref(2 * 1024 * 1024);
+const serverDefaultChunk = ref(1024 * 1024);
 const chunkOptions = computed(() => {
-  const sizes = [...new Set([64, 128, 256, 512, 1024].map(size => size * 1024).filter(size => size <= serverChunkLimit.value).concat(serverChunkLimit.value))].sort((a, b) => a - b);
-  return sizes.map(value => ({ value, label: `${formatBytes(value)}${value === serverChunkLimit.value ? '（默认）' : ''}` }));
+  const sizes = [...new Set([256, 512, 1024, 1536, 2048].map(size => size * 1024).filter(size => size <= serverChunkLimit.value).concat(serverChunkLimit.value))].sort((a, b) => a - b);
+  return sizes.map(value => ({ value, label: `${formatBytes(value)}${value === serverDefaultChunk.value ? '（默认）' : ''}` }));
 });
 const uploadedLength = ref(0);
 const speed = useTransferRate(() => uploadedLength.value);
@@ -389,7 +390,8 @@ const getAccessId = async () => {
     uploadController?.signal.throwIfAborted();
     const config = await getTransferConfig(uploadController?.signal);
     serverChunkLimit.value = config.max_chunk_size || config.chunk_size;
-    selectedChunkSize.value = Math.max(config.min_chunk_size || Math.min(64 * 1024, serverChunkLimit.value), Math.min(selectedChunkSize.value, serverChunkLimit.value));
+    serverDefaultChunk.value = config.chunk_size;
+    selectedChunkSize.value = Math.max(config.min_chunk_size || Math.min(256 * 1024, serverChunkLimit.value), Math.min(selectedChunkSize.value, serverChunkLimit.value));
     chunkSize = selectedChunkSize.value;
     maxTotalSize = config.max_file_size;
     const fileToUpload = (isFolderUpload.value ? zipFile.value : fileList.value?.[0]) as File | undefined;
@@ -898,6 +900,7 @@ onMounted(() => {
   void getTransferConfig().then(config => {
     if (uploadState.value !== 'idle') return;
     serverChunkLimit.value = config.max_chunk_size || config.chunk_size;
+    serverDefaultChunk.value = config.chunk_size;
     selectedChunkSize.value = Math.min(selectedChunkSize.value, serverChunkLimit.value);
   }).catch(() => {});
   sayHello();

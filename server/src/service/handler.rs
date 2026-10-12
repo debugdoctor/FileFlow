@@ -15,7 +15,7 @@ use tracing::{event, instrument, Level};
 use lazy_static::lazy_static;
 
 lazy_static! {
-    static ref MAX_BLOCK_SIZE: u64 = read_env_u64("MAX_BLOCK_SIZE", 1024 * 1024);
+    static ref MAX_BLOCK_SIZE: u64 = read_env_u64("MAX_BLOCK_SIZE", 2 * 1024 * 1024);
     static ref MAX_BLOCKS_PER_FILE: usize = read_env_usize("MAX_BLOCKS_PER_FILE", 10240);
 }
 
@@ -34,9 +34,12 @@ fn max_total_size() -> u64 {
 fn chunk_size() -> u64 {
     max_block_size().min(1024 * 1024)
 }
-/// Maximum size of each file block in bytes (default 1MB, configurable via MAX_BLOCK_SIZE)
+fn max_transfer_chunk_size() -> u64 {
+    max_block_size().min(2 * 1024 * 1024).min(FileBlock::get_db().floor_bytes)
+}
+/// Maximum size of each file block in bytes (default 2MB, configurable via MAX_BLOCK_SIZE)
 fn max_block_size() -> u64 {
-    *MAX_BLOCK_SIZE
+    (*MAX_BLOCK_SIZE).max(256 * 1024)
 }
 /// Maximum number of blocks allowed per file (default 10240, configurable via MAX_BLOCKS_PER_FILE)
 fn max_blocks_per_file() -> usize {
@@ -160,8 +163,8 @@ pub async fn get_transfer_config() -> impl IntoResponse {
         "success": true,
         "data": {
             "chunk_size": chunk_size(),
-            "min_chunk_size": chunk_size().min(64 * 1024),
-            "max_chunk_size": chunk_size(),
+            "min_chunk_size": 256 * 1024,
+            "max_chunk_size": max_transfer_chunk_size(),
             "max_file_size": max_total_size(),
             "cache_bytes": cache.max_bytes,
             "window_bytes": cache.window_bytes,
@@ -409,7 +412,7 @@ pub async fn get_id(
             Err(err) => return err.into_response(),
         }
     } else { chunk_size() };
-    if transfer_chunk_size < chunk_size().min(64 * 1024) || transfer_chunk_size > chunk_size() {
+    if transfer_chunk_size < 256 * 1024 || transfer_chunk_size > max_transfer_chunk_size() {
         return upload_error(StatusCode::BAD_REQUEST, "Chunk size exceeds allowed limits");
     }
 
@@ -1106,7 +1109,7 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_custom_chunk_sizes_are_rejected() {
-        for size in ["0".to_string(), "1".into(), (chunk_size() + 1).to_string(), "invalid".into()] {
+        for size in ["0".to_string(), "1".into(), (128 * 1024).to_string(), (max_transfer_chunk_size() + 1).to_string(), "invalid".into()] {
             let response = get_id(Query(HashMap::from([
                 ("file_name".into(), "test.bin".into()), ("file_size".into(), "4".into()),
                 ("chunk_size".into(), size),
