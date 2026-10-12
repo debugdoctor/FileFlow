@@ -160,9 +160,9 @@ export const acknowledgeBlock = async (fileId: string, start: number, signal?: A
   if (!response.ok || !data?.success) throw new Error('无法确认文件分块，请重试');
 };
 
-export const getTransferConfig = async (signal?: AbortSignal): Promise<{ chunk_size: number; max_file_size: number }> => {
+export const getTransferConfig = async (signal?: AbortSignal): Promise<{ chunk_size: number; max_file_size: number; min_chunk_size?: number; max_chunk_size?: number }> => {
   const { data, response } = await fetchJsonWithRetry<{
-    success?: boolean; data?: { chunk_size: number; max_file_size: number };
+    success?: boolean; data?: { chunk_size: number; max_file_size: number; min_chunk_size?: number; max_chunk_size?: number };
   }>('/api/fileflow/config', { signal });
   if (!response.ok || !data?.success || !data.data
       || !Number.isSafeInteger(data.data.chunk_size) || data.data.chunk_size <= 0

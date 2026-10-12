@@ -730,9 +730,8 @@ onMounted(async () => {
   <div class="download-page">
     <Card v-if="requiresCode" class="code-card">
       <Space direction="vertical" size="large" style="width: 100%">
-        <div class="header">
-          <Download :size="48" :stroke-width="1.5" class="download-icon" />
-          <Title :level="3" style="margin-bottom: 0;">输入 5 位 ID</Title>
+        <div class="compact-header">
+          <Title :level="3">输入 5 位 ID</Title>
           <Text type="secondary">输入接收方提供的 5 位代码即可进入下载</Text>
         </div>
 
@@ -759,9 +758,8 @@ onMounted(async () => {
 
     <Card v-else class="download-card">
       <Space direction="vertical" size="large" style="width: 100%">
-        <div class="header">
-          <Download :size="48" :stroke-width="1.5" class="download-icon" />
-          <Title :level="3" style="margin-bottom: 0;">文件下载</Title>
+        <div class="compact-header">
+          <Title :level="3">文件下载</Title>
           <Text type="secondary">准备接收通过 FileFlow 分享的文件</Text>
         </div>
 
@@ -833,12 +831,18 @@ onMounted(async () => {
 .code-inputs {
   display: grid;
   grid-template-columns: repeat(5, 1fr);
-  gap: 12px;
+  gap: 10px;
+  max-width: 320px;
+  width: 100%;
+  margin: 12px auto;
 }
 
 .code-box {
   width: 100%;
-  height: 56px;
+  height: auto;
+  aspect-ratio: 1;
+  min-width: 0;
+  padding: 0;
   border-radius: 10px;
   border: 1px solid #d9d9d9;
   text-align: center;

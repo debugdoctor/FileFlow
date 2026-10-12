@@ -160,6 +160,8 @@ pub async fn get_transfer_config() -> impl IntoResponse {
         "success": true,
         "data": {
             "chunk_size": chunk_size(),
+            "min_chunk_size": chunk_size().min(64 * 1024),
+            "max_chunk_size": chunk_size(),
             "max_file_size": max_total_size(),
             "cache_bytes": cache.max_bytes,
             "window_bytes": cache.window_bytes,
@@ -401,6 +403,16 @@ pub async fn get_id(
         Err(err) => return err.into_response(),
     };
 
+    let transfer_chunk_size = if query.contains_key("chunk_size") {
+        match parse_u64_param(query.get("chunk_size"), "chunk_size") {
+            Ok(size) => size,
+            Err(err) => return err.into_response(),
+        }
+    } else { chunk_size() };
+    if transfer_chunk_size < chunk_size().min(64 * 1024) || transfer_chunk_size > chunk_size() {
+        return upload_error(StatusCode::BAD_REQUEST, "Chunk size exceeds allowed limits");
+    }
+
     if file_size > max_total_size() {
         event!(Level::WARN, "File too large during ID request: {} bytes > {}", file_size, max_total_size());
         return (
@@ -418,7 +430,7 @@ pub async fn get_id(
     event!(Level::DEBUG, "Generating new ID for file '{}' with size {}", file_name, file_size);
 
     let mut meta_info = MetaInfo::new(file_name, file_size);
-    meta_info.block_size = chunk_size() as u32;
+    meta_info.block_size = transfer_chunk_size as u32;
 
     match MetaInfo::get_db().insert(&id, meta_info, META_TTL_SECS).await {
         Ok(_) => {
@@ -1072,5 +1084,34 @@ mod tests {
         let upload = FileBlock::get_db().begin_upload(id, token).unwrap();
         upload.commit(FileBlock::new(&Bytes::from_static(b"test"), "test".into(), 0, 3, 4)).unwrap();
         FileBlock::get_db().finish(id).await;
+    }
+
+    #[tokio::test]
+    async fn custom_chunk_size_is_shared_with_receiver_and_preserves_file_limit() {
+        let response = get_id(Query(HashMap::from([
+            ("file_name".into(), "custom.bin".into()),
+            ("file_size".into(), max_total_size().to_string()),
+            ("chunk_size".into(), (256 * 1024).to_string()),
+        ]))).await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
+        let id = body["data"]["id"].as_str().unwrap();
+        let meta = MetaInfo::get_db().get(id).await.unwrap();
+        assert_eq!(meta.value.block_size, 256 * 1024);
+        assert_eq!(meta.value.file_size, max_total_size());
+        let status = get_status(Path(id.into())).await.into_response();
+        let status: serde_json::Value = serde_json::from_slice(&to_bytes(status.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(status["data"]["chunk_size"], 256 * 1024);
+    }
+
+    #[tokio::test]
+    async fn invalid_custom_chunk_sizes_are_rejected() {
+        for size in ["0".to_string(), "1".into(), (chunk_size() + 1).to_string(), "invalid".into()] {
+            let response = get_id(Query(HashMap::from([
+                ("file_name".into(), "test.bin".into()), ("file_size".into(), "4".into()),
+                ("chunk_size".into(), size),
+            ]))).await.into_response();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
     }
 }

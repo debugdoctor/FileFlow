@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from 'vue';
-import { Upload as UploadIcon, FileText, HardDrive, X, Copy, Check, Files, Square } from 'lucide-vue-next';
-import { message, Button, Upload, Progress, Card, Typography, Space, Alert, InputNumber } from 'ant-design-vue';
+import { FileText, HardDrive, X, Copy, Check, Files, Square, Settings2, ChevronDown } from 'lucide-vue-next';
+import { message, Button, Upload, Progress, Typography, Space, InputNumber, Select } from 'ant-design-vue';
 import type { UploadProps } from 'ant-design-vue';
 import { uploadFile, fetchJsonWithRetry, fetchWithRetry, getTransferConfig } from '@/utils/requests';
 import { processUploadWithConcurrencyLimit } from '@/utils/asyncPool';
@@ -74,6 +74,13 @@ const copyDownloadLink = async () => {
 };
 const uploadProgress = ref(0);
 const receiverWaitMinutes = ref(5);
+const selectedChunkSize = ref(1024 * 1024);
+const uploadConcurrency = ref(4);
+const serverChunkLimit = ref(1024 * 1024);
+const chunkOptions = computed(() => {
+  const sizes = [...new Set([64, 128, 256, 512, 1024].map(size => size * 1024).filter(size => size <= serverChunkLimit.value).concat(serverChunkLimit.value))].sort((a, b) => a - b);
+  return sizes.map(value => ({ value, label: `${formatBytes(value)}${value === serverChunkLimit.value ? '（默认）' : ''}` }));
+});
 const uploadedLength = ref(0);
 const speed = useTransferRate(() => uploadedLength.value);
 const is_online = ref(false);
@@ -381,7 +388,9 @@ const getAccessId = async () => {
   try {
     uploadController?.signal.throwIfAborted();
     const config = await getTransferConfig(uploadController?.signal);
-    chunkSize = config.chunk_size;
+    serverChunkLimit.value = config.max_chunk_size || config.chunk_size;
+    selectedChunkSize.value = Math.max(config.min_chunk_size || Math.min(64 * 1024, serverChunkLimit.value), Math.min(selectedChunkSize.value, serverChunkLimit.value));
+    chunkSize = selectedChunkSize.value;
     maxTotalSize = config.max_file_size;
     const fileToUpload = (isFolderUpload.value ? zipFile.value : fileList.value?.[0]) as File | undefined;
     if (!fileToUpload) {
@@ -400,7 +409,7 @@ const getAccessId = async () => {
       return;
     }
     const { data, response } = await fetchJsonWithRetry<{ success?: boolean; data?: { id: string } }>(
-      `/api/fileflow/id?${new URLSearchParams({ file_name: fileToUpload.name, file_size: String(fileSize) })}`,
+      `/api/fileflow/id?${new URLSearchParams({ file_name: fileToUpload.name, file_size: String(fileSize), chunk_size: String(chunkSize) })}`,
       { method: 'get', signal: uploadController?.signal },
       { timeoutMs: 12000, retries: 2 },
     );
@@ -787,7 +796,7 @@ const handleUpload = async () => {
       }
 
       // Process uploads with a concurrency limit of 4
-      await processUploadWithConcurrencyLimit(uploadPromises, 4, (seq_len) => {
+      await processUploadWithConcurrencyLimit(uploadPromises, Math.max(1, Math.min(8, Math.round(uploadConcurrency.value))), (seq_len) => {
         controller.signal.throwIfAborted();
         uploadedLength.value += seq_len;
         uploadProgress.value = Math.round((uploadedLength.value / fileSize) * 100);
@@ -886,6 +895,11 @@ const sayHello = async () => {
 };
 
 onMounted(() => {
+  void getTransferConfig().then(config => {
+    if (uploadState.value !== 'idle') return;
+    serverChunkLimit.value = config.max_chunk_size || config.chunk_size;
+    selectedChunkSize.value = Math.min(selectedChunkSize.value, serverChunkLimit.value);
+  }).catch(() => {});
   sayHello();
   intervalRef.value = setInterval(() => {
     sayHello();
@@ -907,14 +921,7 @@ onUnmounted(() => {
   <div class="file-upload-container">
     <div class="upload-card">
       <Space direction="vertical" size="large" style="width: 100%; max-width: 600px;">
-        <div class="header">
-          <UploadIcon :size="48" :stroke-width="1.5" class="upload-icon" />
-          <Title :level="3" style="margin-bottom: 0;">文件上传</Title>
-          <Text type="secondary">通过 FileFlow 快速安全地分享文件</Text>
-        </div>
-
-        <Alert type="info" show-icon message="服务状态" :description="is_online ? '已连接到服务器，可以正常上传文件' : '无法连接到服务器，请检查网络连接'"
-          :class="is_online ? 'status-online' : 'status-offline'" />
+        <div class="connection-status" role="status" aria-live="polite"><span class="connection-dot" :class="{ online: is_online }"></span><span>{{ is_online ? '服务器已连接' : '服务器未连接' }}</span></div>
 
         <div v-if="uploadState === 'pending'" class="wait-time-container">
           <Text type="warning">等待接收方连接中... 剩余等待时间: {{ remainingPolls }} 秒</Text>
@@ -963,13 +970,21 @@ onUnmounted(() => {
           </div>
         </div>
 
-        <Space>
-          <label for="receiver-wait-minutes">等待接收方连接：</label>
-          <InputNumber id="receiver-wait-minutes" v-model:value="receiverWaitMinutes"
-            aria-label="等待接收方连接时间（分钟）" :min="1" :max="1440" :precision="0"
-            :disabled="uploadState !== 'idle'" />
-          <Text>分钟</Text>
-        </Space>
+        <details class="advanced-settings">
+          <summary><Settings2 :size="16" :stroke-width="1.7" /><span>高级设置</span><ChevronDown :size="15" class="advanced-chevron" /></summary>
+          <div class="advanced-fields">
+            <div class="advanced-field"><label for="upload-chunk-size">分块大小</label>
+              <Select id="upload-chunk-size" aria-label="分块大小" v-model:value="selectedChunkSize" :options="chunkOptions" :disabled="uploadState !== 'idle'" />
+            </div>
+            <div class="advanced-field"><label for="upload-concurrency">上传并发</label>
+              <Select id="upload-concurrency" aria-label="上传并发" v-model:value="uploadConcurrency" :options="[1, 2, 4, 8].map(value => ({ value, label: `${value} 路${value === 4 ? '（默认）' : ''}` }))" :disabled="uploadState !== 'idle'" />
+            </div>
+            <div class="advanced-field"><label for="receiver-wait-minutes">接收等待</label>
+              <InputNumber id="receiver-wait-minutes" v-model:value="receiverWaitMinutes" aria-label="等待接收方连接时间（分钟）" :min="1" :max="1440" :precision="0" addon-after="分钟" :disabled="uploadState !== 'idle'" />
+            </div>
+          </div>
+          <p class="advanced-hint">默认即可使用。网络波动时，可减小分块或降低并发。</p>
+        </details>
 
         <div class="action-buttons">
           <Button type="default" size="large" :disabled="uploadState !== 'idle'" @click="triggerFolderSelect">

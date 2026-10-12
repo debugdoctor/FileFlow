@@ -39,6 +39,23 @@ a { color: var(--flow-primary); }
 .stop-transfer-button:hover { color: #c35b68 !important; border-color: #e8bbc2 !important; background: #fff8f9 !important; }
 .download-actions { display: flex; gap: 12px; align-items: center; margin: 16px 0; }
 .download-actions .download-button { flex: 1; min-width: 0; margin: 0; }
+.advanced-settings { border-top: 1px solid #edf1f9; padding-top: 16px; }
+.advanced-settings summary { display: flex; align-items: center; gap: 9px; color: #74819c; font-size: 13px; cursor: pointer; list-style: none; }
+.advanced-settings summary::-webkit-details-marker { display: none; }
+.advanced-chevron { margin-left: auto; transition: transform .15s; }
+.advanced-settings[open] .advanced-chevron { transform: rotate(180deg); }
+.advanced-fields { display: grid; grid-template-columns: 1fr 1fr 1.2fr; gap: 18px; padding-top: 20px; }
+.advanced-field { min-width: 0; display: grid; gap: 9px; }
+.advanced-field label { font-size: 12px; color: #7c879d; }
+.advanced-field .ant-select, .advanced-field .ant-input-number-group-wrapper { width: 100%; }
+.advanced-hint { color: #99a3b5; font-size: 11px; margin: 14px 0 0; line-height: 1.7; }
+.connection-status { display: flex; align-items: center; justify-content: flex-end; gap: 7px; color: #8994a9; font-size: 12px; line-height: 1.5; }
+.connection-dot { width: 6px; height: 6px; border-radius: 50%; background: #d39478; flex-shrink: 0; }
+.connection-dot.online { background: #60b490; }
+.compact-header { text-align: center; padding: 4px 0 8px; }
+.compact-header h3 { font-size: 21px !important; font-weight: 600 !important; margin-bottom: 10px !important; color: #23324d !important; }
+.compact-header .ant-typography-secondary { font-size: 12px; color: #8994a9; }
+@media (max-width: 600px) { .advanced-fields { grid-template-columns: 1fr; gap: 16px; } }
 .visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0; }
 .file-info { background: #f6f9ff !important; border: 1px solid #e5ebf7; border-radius: 14px !important; }
 .file-icon { color: #5487ef !important; flex-shrink: 0; }
