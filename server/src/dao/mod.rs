@@ -1,2 +1,2 @@
 pub mod db;
-mod memdb;
+pub(crate) mod memdb;

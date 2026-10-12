@@ -19,6 +19,22 @@ pub struct MetaInfo {
 
 impl MetaInfo {
 
+    pub async fn claim(id: &str, receiver: &str) -> Result<(), &'static str> {
+        if receiver.is_empty() {
+            return Err("Missing receiver ID");
+        }
+        let db = Self::get_db();
+        let mut store = db.store.write().await;
+        let entry = store.get_mut(id).filter(|entry| entry.exp > std::time::Instant::now())
+            .ok_or("Access ID Not Found")?;
+        if entry.value.is_using && entry.value.used_by != receiver {
+            return Err("File already in use");
+        }
+        entry.value.is_using = true;
+        entry.value.used_by = receiver.to_owned();
+        Ok(())
+    }
+
     pub fn get_db() -> Arc<MemDB<MetaInfo>> {
         META_INFO_DB.clone()
     }

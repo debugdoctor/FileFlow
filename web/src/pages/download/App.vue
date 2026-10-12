@@ -18,7 +18,7 @@ const codeInputs = ref<Array<HTMLInputElement | null>>([]);
 const activeFileId = ref<string | null>(null);
 
 const P2P_MAX_BUFFERED_AMOUNT = 8 * 1024 * 1024;
-const P2P_CONNECT_TIMEOUT_MS = 5000;
+const P2P_CONNECT_TIMEOUT_MS = 15000;
 const P2P_SIGNAL_POLL_MS = 1000;
 
 const formatBytes = (bytes: number, decimals = 2) => {
@@ -87,7 +87,7 @@ const postSignal = async (payload: { role: 'sender' | 'receiver'; type: string; 
   if (!activeFileId.value) {
     throw new Error('AccessId 为空，无法发送信令');
   }
-  await fetchWithRetry(
+  const response = await fetchWithRetry(
     `/api/fileflow/${activeFileId.value}/signal`,
     {
       method: 'POST',
@@ -96,6 +96,7 @@ const postSignal = async (payload: { role: 'sender' | 'receiver'; type: string; 
     },
     { timeoutMs: 6000, retries: 2 },
   );
+  if (!response.ok) throw new Error(`信令发送失败: ${response.status}`);
 };
 
 const getSignals = async (role: 'sender' | 'receiver', since: number) => {
@@ -187,6 +188,8 @@ const downloadViaP2P = async (config: P2pConfig) => {
   let completed = false;
   let shouldCleanup = false;
   let transferError: Error | null = null;
+  let lastActivity = Date.now();
+  const pendingCandidates: RTCIceCandidateInit[] = [];
 
   let dataChannel: RTCDataChannel | null = null;
   const pc = new RTCPeerConnection({ iceServers });
@@ -206,6 +209,11 @@ const downloadViaP2P = async (config: P2pConfig) => {
 
   const finalizeDownload = async () => {
     if (completed) return;
+    if (receivedBytes !== totalSize) {
+      transferError = new Error('P2P 文件大小不完整');
+      completed = true;
+      return;
+    }
     completed = true;
 
     const blob = new Blob(chunks, { type: 'application/octet-stream' });
@@ -219,6 +227,10 @@ const downloadViaP2P = async (config: P2pConfig) => {
     URL.revokeObjectURL(url);
 
     message.success('文件下载完成!');
+
+    if (dataChannel?.readyState === 'open') {
+      dataChannel.send(JSON.stringify({ type: 'done' }));
+    }
 
     try {
       await fetchWithRetry(
@@ -236,10 +248,6 @@ const downloadViaP2P = async (config: P2pConfig) => {
       message.warning('无法通知服务器下载完成，但文件已成功下载');
     }
 
-    if (dataChannel?.readyState === 'open') {
-      dataChannel.send(JSON.stringify({ type: 'done' }));
-    }
-
     if (totalSize > 0) {
       downloadProgress.value = 100;
     }
@@ -247,13 +255,18 @@ const downloadViaP2P = async (config: P2pConfig) => {
 
   const handleSignal = async (msg: SignalMessage) => {
     if (msg.msg_type === 'offer' && msg.data) {
+      if (pc.remoteDescription) return;
       await pc.setRemoteDescription(new RTCSessionDescription(msg.data));
+      for (const candidate of pendingCandidates.splice(0)) {
+        await pc.addIceCandidate(candidate);
+      }
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
       await postSignal({ role: 'receiver', type: 'answer', data: answer, rid: receiverId });
     } else if (msg.msg_type === 'candidate' && msg.data) {
       try {
-        await pc.addIceCandidate(new RTCIceCandidate(msg.data));
+        if (!pc.remoteDescription) pendingCandidates.push(msg.data);
+        else await pc.addIceCandidate(new RTCIceCandidate(msg.data));
       } catch (error) {
         console.warn('添加 ICE 候选失败', error);
       }
@@ -264,7 +277,10 @@ const downloadViaP2P = async (config: P2pConfig) => {
 
   pc.onicecandidate = (event) => {
     if (event.candidate) {
-      void postSignal({ role: 'receiver', type: 'candidate', data: event.candidate, rid: receiverId });
+      void postSignal({ role: 'receiver', type: 'candidate', data: event.candidate, rid: receiverId }).catch(error => {
+        transferError = error instanceof Error ? error : new Error('ICE 信令发送失败');
+        completed = true;
+      });
     }
   };
 
@@ -300,6 +316,8 @@ const downloadViaP2P = async (config: P2pConfig) => {
         }
       });
       dataChannel.addEventListener('message', async (event) => {
+        if (completed) return;
+        lastActivity = Date.now();
         if (typeof event.data === 'string') {
           try {
             const msg = JSON.parse(event.data);
@@ -309,8 +327,7 @@ const downloadViaP2P = async (config: P2pConfig) => {
                 fileName.value = msg.name;
               }
               if (msg.size) {
-                totalSize = msg.size;
-                fileSize.value = msg.size;
+                if (msg.size !== totalSize) throw new Error('P2P 文件大小与服务器信息不一致');
               }
               return;
             }
@@ -318,7 +335,9 @@ const downloadViaP2P = async (config: P2pConfig) => {
               await finalizeDownload();
               return;
             }
-          } catch {
+          } catch (error) {
+            transferError = error instanceof Error ? error : new Error('P2P 数据处理失败');
+            completed = true;
             return;
           }
         }
@@ -328,8 +347,9 @@ const downloadViaP2P = async (config: P2pConfig) => {
           receivedBytes += event.data.byteLength;
           if (totalSize > 0) {
             downloadProgress.value = Math.round((receivedBytes / totalSize) * 100);
-            if (receivedBytes >= totalSize) {
-              await finalizeDownload();
+            if (receivedBytes > totalSize) {
+              transferError = new Error('P2P 文件大小不匹配');
+              completed = true;
             }
           }
         }
@@ -341,10 +361,17 @@ const downloadViaP2P = async (config: P2pConfig) => {
     while (pollActive) {
       try {
         const signalData = await getSignals('receiver', signalSeq);
-        signalSeq = signalData.latest ?? signalSeq;
         for (const msg of signalData.messages || []) {
+          if (msg.msg_type === 'fallback') {
+            transferError = new Error('发送方要求回退 HTTP');
+            completed = true;
+            pollActive = false;
+            cleanup();
+            break;
+          }
           await handleSignal(msg);
         }
+        signalSeq = signalData.latest ?? signalSeq;
       } catch (error) {
         console.warn('获取信令失败', error);
       }
@@ -353,11 +380,14 @@ const downloadViaP2P = async (config: P2pConfig) => {
   };
 
   try {
+    // Attach a rejection handler before posting signaling, which may outlast the timer.
+    void channelReady.catch(() => {});
     await postSignal({ role: 'receiver', type: 'ready', data: {}, rid: receiverId });
     void pollSignals();
     await channelReady;
 
     while (!completed) {
+      if (Date.now() - lastActivity > 30000) throw new Error('P2P 接收超时');
       await sleep(500);
     }
     pollActive = false;
@@ -367,6 +397,7 @@ const downloadViaP2P = async (config: P2pConfig) => {
     cleanup();
     return true;
   } catch (error) {
+    cleanup();
     shouldCleanup = true;
     try {
       await postSignal({
@@ -387,6 +418,7 @@ const downloadViaP2P = async (config: P2pConfig) => {
 };
 
 const handleGetFile = async () => {
+  if (isDownloading.value || isFinished.value) return;
   if (!activeFileId.value) {
     message.warning('请先输入有效的 5 位 ID');
     return;
@@ -437,9 +469,7 @@ const handleGetFile = async () => {
         }
       });
     } catch (error) {
-      message.error('下载过程中发生错误: ' + (error instanceof Error ? error.message : '未知错误'));
-      isDownloading.value = false;
-      return;
+      throw new Error('下载过程中发生错误: ' + (error instanceof Error ? error.message : '未知错误'));
     }
 
     await new Promise<void>(resolve => { setTimeout(resolve, 500)});
@@ -454,12 +484,12 @@ const handleGetFile = async () => {
 
         for (const [start, chunk] of sortedChunks) {
           if (start !== offset) {
-            message.error(`文件 ${fileName.value} 中有缺失的块，请重新上传`);
-            return;
+            throw new Error(`文件 ${fileName.value} 中有缺失的块，请重试`);
           }
           combinedData.set(chunk, offset);
           offset += chunk.length;
         }
+        if (offset !== fileSize.value) throw new Error('文件大小不完整，请重试');
 
         // Create a Blob from the combined data
         const blob = new Blob([combinedData], { type: 'application/octet-stream' });
@@ -499,15 +529,24 @@ const handleGetFile = async () => {
           message.warning('无法通知服务器下载完成，但文件已成功下载');
         }
       } catch (error) {
-        message.error('保存文件时发生错误: ' + (error instanceof Error ? error.message : '未知错误'));
+        throw new Error('保存文件时发生错误: ' + (error instanceof Error ? error.message : '未知错误'));
       }
     } else {
-      message.error('没有下载到任何文件数据');
+      throw new Error('没有下载到任何文件数据');
     }
 
     isDownloading.value = false;
     isFinished.value = true;
   };
+
+  // Claim the receiver before launching parallel range requests, including HTTP-only transfers.
+  try {
+    await postSignal({ role: 'receiver', type: 'ready', data: {}, rid: localStorage.getItem('rid') || '' });
+  } catch (error) {
+    message.error(error instanceof Error ? error.message : '无法连接发送方');
+    isDownloading.value = false;
+    return;
+  }
 
   const p2pConfig = await getP2pConfig();
   if (hasP2pConfig(p2pConfig)) {
@@ -524,7 +563,13 @@ const handleGetFile = async () => {
     }
   }
 
-  await downloadViaHttp();
+  try {
+    await downloadViaHttp();
+  } catch (error) {
+    message.error(error instanceof Error ? error.message : '下载失败');
+  } finally {
+    isDownloading.value = false;
+  }
 }
 
 onMounted(async () => {

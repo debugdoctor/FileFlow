@@ -1,7 +1,7 @@
-use std::{collections::HashMap, env};
+use std::{collections::HashMap, env, time::Instant};
 
 use crate::{
-    dao::db::{FileBlock, MetaInfo, SignalMessage, SignalState},
+    dao::{db::{FileBlock, MetaInfo, SignalMessage, SignalState}, memdb::CacheEntry},
     service::static_files::StaticFiles,
     utils::nanoid,
 };
@@ -17,16 +17,11 @@ use lazy_static::lazy_static;
 lazy_static! {
     static ref MAX_BLOCK_SIZE: u64 = read_env_u64("MAX_BLOCK_SIZE", 1024 * 1024);
     static ref MAX_BLOCKS_PER_FILE: usize = read_env_usize("MAX_BLOCKS_PER_FILE", 1024);
+    static ref BLOCK_TTL_SECS: u64 = read_env_u64("BLOCK_TTL_SECS", 600);
 }
 
-/// Maximum number of retry attempts for database operations
-const MAX_RETRIES: u32 = 5;
-/// Interval between retry attempts in milliseconds
-const RETRY_INTERVAL: u64 = 250;
 /// TTL for metadata entries (seconds)
 const META_TTL_SECS: u64 = 60 * 60 * 24;
-/// TTL for file block entries (seconds)
-const BLOCK_TTL_SECS: u64 = 60;
 /// TTL for signaling data (seconds)
 const SIGNAL_TTL_SECS: u64 = 60 * 60;
 /// Retry settings for fetching file blocks (kept below client timeout)
@@ -35,7 +30,7 @@ const BLOCK_FETCH_RETRY_INTERVAL: u64 = 250;
 
 /// Aggregate file size limit derived from block constraints
 fn max_total_size() -> u64 {
-    max_block_size() * max_blocks_per_file() as u64
+    max_block_size().saturating_mul(max_blocks_per_file() as u64)
 }
 /// Maximum size of each file block in bytes (default 1MB, configurable via MAX_BLOCK_SIZE)
 fn max_block_size() -> u64 {
@@ -44,6 +39,16 @@ fn max_block_size() -> u64 {
 /// Maximum number of blocks allowed per file (default 1024, configurable via MAX_BLOCKS_PER_FILE)
 fn max_blocks_per_file() -> usize {
     *MAX_BLOCKS_PER_FILE
+}
+
+fn encode_header_filename(filename: &str) -> String {
+    filename.as_bytes().iter().map(|byte| {
+        if byte.is_ascii_alphanumeric() || b"-._~".contains(byte) {
+            (*byte as char).to_string()
+        } else {
+            format!("%{:02X}", byte)
+        }
+    }).collect()
 }
 
 fn parse_u64_param(value: Option<&String>, field: &str) -> Result<u64, (StatusCode, Json<serde_json::Value>)> {
@@ -197,20 +202,26 @@ pub async fn post_signal(
     }
 
     if msg_type == "ready" && role == "receiver" {
-        if let Some(receive_id) = payload.rid.clone() {
-            if let Some(mut meta_info) = MetaInfo::get_db().get(&id).await {
-                meta_info.value.is_using = true;
-                meta_info.value.used_by = receive_id;
-                let _ = MetaInfo::get_db().update(&id, meta_info.value, meta_info.exp).await;
-            }
+        if let Err(message) = MetaInfo::claim(&id, payload.rid.as_deref().unwrap_or("")).await {
+            return (StatusCode::BAD_REQUEST, Json(json!({
+                "code": 400, "success": false, "message": message
+            }))).into_response();
         }
     }
 
-    let mut state = SignalState::get_db()
-        .get(&id)
-        .await
-        .map(|entry| entry.value)
-        .unwrap_or_else(SignalState::new);
+    // Append under one lock so simultaneous ICE candidates cannot overwrite each other.
+    let db = SignalState::get_db();
+    let mut store = db.store.write().await;
+    let now = Instant::now();
+    let entry = store.entry(id).or_insert_with(|| CacheEntry {
+        value: SignalState::new(),
+        exp: now + std::time::Duration::from_secs(SIGNAL_TTL_SECS),
+    });
+    if entry.exp <= now {
+        entry.value = SignalState::new();
+    }
+    entry.exp = now + std::time::Duration::from_secs(SIGNAL_TTL_SECS);
+    let state = &mut entry.value;
 
     state.seq = state.seq.saturating_add(1);
     let seq = state.seq;
@@ -227,25 +238,14 @@ pub async fn post_signal(
         state.messages.drain(0..drain_len);
     }
 
-    match SignalState::get_db().insert(&id, state, SIGNAL_TTL_SECS).await {
-        Ok(_) => Json(json!({
+    Json(json!({
             "code": 200,
             "success": true,
             "data": {
                 "seq": seq
             }
         }))
-        .into_response(),
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({
-                "code": 500,
-                "success": false,
-                "message": err
-            })),
-        )
-            .into_response(),
-    }
+        .into_response()
 }
 
 /// Handler for fetching WebRTC signaling messages
@@ -457,73 +457,11 @@ pub async fn get_file(
     };
 
     if start == 0 {
-        // Changed from INFO to DEBUG to reduce log verbosity
-        event!(Level::DEBUG, "Starting file download for ID: {} by receiver: {}", id, receive_id);
-        // Try to get the metadata and atomically update it in a single operation
-        let mut retries = 0;
-        
-        loop {
-            let meta_info = MetaInfo::get_db().get(&id).await;
-            
-            match meta_info {
-                Some(mut current_meta) => {
-                    if current_meta.value.is_using
-                        && !current_meta.value.used_by.is_empty()
-                        && current_meta.value.used_by != receive_id
-                    {
-                        event!(Level::WARN, "File already in use for ID: {}", id);
-                        return (
-                        StatusCode::BAD_REQUEST,
-                        Json(json!({
-                            "code": 400,
-                            "success": false,
-                            "message": "Bad Request"
-                        })))
-                        .into_response();
-                    }
-
-                    let should_update = !current_meta.value.is_using
-                        || current_meta.value.used_by.is_empty()
-                        || current_meta.value.used_by != receive_id;
-
-                    if should_update {
-                        current_meta.value.is_using = true;
-                        current_meta.value.used_by = receive_id.clone();
-
-                        match MetaInfo::get_db().update(&id, current_meta.value, current_meta.exp).await {
-                            Ok(_) => {
-                                event!(Level::DEBUG, "Successfully updated metadata for ID: {}", id);
-                                break;
-                            }
-                            Err(_) => {
-                                retries += 1;
-                                if retries >= MAX_RETRIES {
-                                    event!(Level::ERROR, "Failed to update metadata after {} retries for ID: {}", MAX_RETRIES, id);
-                                    return (
-                                    StatusCode::INTERNAL_SERVER_ERROR,
-                                    Json(json!({
-                                        "code": 500,
-                                        "success": false,
-                                        "message": "Internal Server Error"
-                                    })))
-                                    .into_response();
-                                }
-                                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                            }
-                        }
-                    } else {
-                        break;
-                    }
-                }
-                None => {
-                    event!(Level::WARN, "Access ID Not Found: {}", id);
-                    return (StatusCode::NOT_FOUND, "Access ID Not Found").into_response();
-                }
-            }
+        if let Err(message) = MetaInfo::claim(&id, &receive_id).await {
+            return (StatusCode::BAD_REQUEST, Json(json!({
+                "code": 400, "success": false, "message": message
+            }))).into_response();
         }
-        
-        // Small delay to ensure atomicity
-        tokio::time::sleep(tokio::time::Duration::from_millis(RETRY_INTERVAL)).await;
     }
 
     match MetaInfo::get_db().get(&id).await {
@@ -585,26 +523,10 @@ pub async fn get_file(
         }
     };
 
-    // Delete the block in a separate async task to prevent blocking the response
-    // This ensures that even if the deletion fails, the response is still sent
-    let delete_task = async |id, start|{
-        match FileBlock::get_db().remove(&format!("{}:{:012}", &id, start)).await {
-            Some(_) => {
-                // Changed from DEBUG to TRACE to reduce log verbosity
-                event!(Level::TRACE, "Successfully removed block {}:{:012}", &id, start);
-            }
-            None => {
-                // Changed from WARN to TRACE to reduce log verbosity
-                event!(Level::TRACE, "Attempted to remove non-existent block {}:{:012}", &id, start);
-            }
-        }
-    };
-    
-    // Spawn the deletion task but don't wait for it to complete
-    tokio::spawn(delete_task(id.clone(), start));
+    // Keep blocks available for retries until the receiver acknowledges completion.
 
     let headers: [(&str, &str); 3] = [
-        ("Content-Name", &block_name),
+        ("Content-Name", &encode_header_filename(&block_name)),
         ("Content-Type", "application/octet-stream"),
         ("Content-Range", &format!("bytes {}-{}/{}", block_start, block_end, block_total)),
     ];
@@ -751,7 +673,7 @@ pub async fn upload_file(Path(id): Path<String>, multipart: Multipart) -> impl I
         end = info.end;
         total = info.total;
 
-        if end < start || total == 0 || start >= total {
+        if end < start || total == 0 || start >= total || end >= total {
             event!(Level::WARN, "Invalid range in info part: start={}, end={}, total={}", start, end, total);
             return (
                 StatusCode::BAD_REQUEST,
@@ -885,7 +807,8 @@ pub async fn upload_file(Path(id): Path<String>, multipart: Multipart) -> impl I
         let file_block_db = FileBlock::get_db();
         let mut block_count = 0;
         let prefix = format!("{}:", id);
-        let store = file_block_db.store.read().await;
+        let mut store = file_block_db.store.write().await;
+        let block_key = format!("{}:{:012}", &id, start);
         
         for key in store.keys() {
             if key.starts_with(&prefix) {
@@ -896,9 +819,7 @@ pub async fn upload_file(Path(id): Path<String>, multipart: Multipart) -> impl I
                 break;
             }
         }
-        drop(store);
-
-        if block_count >= max_blocks_per_file() {
+        if block_count >= max_blocks_per_file() && !store.contains_key(&block_key) {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(json!({
@@ -918,27 +839,11 @@ pub async fn upload_file(Path(id): Path<String>, multipart: Multipart) -> impl I
             total,
         );
 
-        match FileBlock::get_db()
-            .insert(&format!("{}:{:012}", &id, start), file_block, BLOCK_TTL_SECS)
-            .await
-        {
-            Ok(_) => {
-                // Changed from INFO to DEBUG to reduce log verbosity for large files
-                event!(Level::DEBUG, "Successfully uploaded block for '{}' range {}-{} of total {} for ID: {}", filename, start, end, total, id);
-            },
-            Err(e) => {
-                event!(Level::ERROR, "Failed to insert file block into DB: {} for ID: {}", e, id);
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({
-                        "code": 500,
-                        "success": false,
-                        "message": "Internal Server Error"
-                    }))
-                )
-                .into_response();
-            }
-        }
+        store.insert(block_key, CacheEntry {
+            value: file_block,
+            exp: Instant::now() + std::time::Duration::from_secs(*BLOCK_TTL_SECS),
+        });
+        event!(Level::DEBUG, "Successfully uploaded block for '{}' range {}-{} of total {} for ID: {}", filename, start, end, total, id);
     }
 
     Json(json!({
@@ -959,6 +864,8 @@ pub async fn done(Path(id): Path<String>, Json(_payload): Json<serde_json::Value
             meta_info.value.done = true;
             match MetaInfo::get_db().update(&id, meta_info.value, meta_info.exp).await {
                 Ok(_) => {
+                    let prefix = format!("{}:", id);
+                    FileBlock::get_db().store.write().await.retain(|key, _| !key.starts_with(&prefix));
                     event!(Level::DEBUG, "Download marked as complete for ID: {}", id);
                     (
                         StatusCode::OK,
@@ -1013,5 +920,61 @@ pub async fn get_assets(Path(file): Path<String>) -> impl IntoResponse {
             event!(Level::WARN, "Asset file not found: {}", file);
             (StatusCode::NOT_FOUND, "File not found").into_response()
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::{to_bytes, Bytes};
+
+    #[tokio::test]
+    async fn downloaded_blocks_remain_retryable_until_done() {
+        let id = "test-retry-block";
+        MetaInfo::get_db().insert(id, MetaInfo::new("中文 & test.txt".into(), 4), 60).await.unwrap();
+        FileBlock::get_db().insert(&format!("{}:{:012}", id, 0),
+            FileBlock::new(&Bytes::from_static(b"test"), "中文 & test.txt".into(), 0, 3, 4), 60).await.unwrap();
+        let query = HashMap::from([("rid".into(), "receiver".into()), ("start".into(), "0".into())]);
+        for _ in 0..2 {
+            let response = get_file(Path(id.into()), Query(query.clone())).await.into_response();
+            assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+            assert_eq!(response.headers()["content-name"], "%E4%B8%AD%E6%96%87%20%26%20test.txt");
+            assert_eq!(to_bytes(response.into_body(), 100).await.unwrap(), "test");
+        }
+        let response = done(Path(id.into()), Json(json!({}))).await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(FileBlock::get_db().get(&format!("{}:{:012}", id, 0)).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn concurrent_signals_preserve_every_message() {
+        let id = "test-signal-concurrency";
+        let mut tasks = Vec::new();
+        for index in 0..50 {
+            tasks.push(tokio::spawn(async move {
+                let response = post_signal(Path(id.into()), Json(SignalPostPayload {
+                    role: "sender".into(), msg_type: "candidate".into(),
+                    data: json!({"index": index}), rid: None,
+                })).await.into_response();
+                assert_eq!(response.status(), StatusCode::OK);
+            }));
+        }
+        for task in tasks { task.await.unwrap(); }
+        let entry = SignalState::get_db().get(id).await.unwrap();
+        assert_eq!(entry.value.seq, 50);
+        assert_eq!(entry.value.messages.len(), 50);
+        for (index, message) in entry.value.messages.iter().enumerate() {
+            assert_eq!(message.seq, index as u64 + 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn only_one_receiver_can_claim_a_transfer() {
+        let id = "test-receiver-claim";
+        MetaInfo::get_db().insert(id, MetaInfo::new("test".into(), 4), 60).await.unwrap();
+        let (first, second) = tokio::join!(MetaInfo::claim(id, "first"), MetaInfo::claim(id, "second"));
+        assert_ne!(first.is_ok(), second.is_ok());
+        let winner = if first.is_ok() { "first" } else { "second" };
+        assert!(MetaInfo::claim(id, winner).await.is_ok());
     }
 }

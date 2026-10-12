@@ -87,19 +87,4 @@ impl <T: Send + Sync + Clone + 'static> MemDB<T> {
         result
     }
 
-    pub async fn remove(&self, key: &str) -> Option<CacheEntry<T>> {
-        let result = self.store
-            .write()
-            .await
-            .remove(key);
-            
-        // Changed from DEBUG to TRACE to reduce log verbosity
-        if result.is_some() {
-            event!(Level::TRACE, "Removed key: {}", key);
-        } else {
-            event!(Level::TRACE, "Attempted to remove non-existent key: {}", key);
-        }
-        
-        result
-    }
 }

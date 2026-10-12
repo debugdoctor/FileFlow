@@ -161,7 +161,11 @@ export const downloadFile = async (fileId: string, start: number, fileName: Ref<
       const contentRange = response.headers.get("Content-Range");
       const contentName = response.headers.get("Content-Name");
       if (contentName) {
-        fileName.value = contentName;
+        try {
+          fileName.value = decodeURIComponent(contentName);
+        } catch {
+          fileName.value = contentName;
+        }
       }
 
       if (contentRange) {

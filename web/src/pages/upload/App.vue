@@ -9,9 +9,9 @@ import JSZip from 'jszip';
 
 const CHUNK_SIZE = 1024 * 1024;
 const MAX_TOTAL_SIZE = CHUNK_SIZE * 1024; // keep in sync with server limits (1GB)
-const P2P_CHUNK_SIZE = 64 * 1024;
+const P2P_CHUNK_SIZE = 16 * 1024;
 const P2P_MAX_BUFFERED_AMOUNT = 8 * 1024 * 1024;
-const P2P_CONNECT_TIMEOUT_MS = 5000;
+const P2P_CONNECT_TIMEOUT_MS = 15000;
 const P2P_SIGNAL_POLL_MS = 1000;
 
 const fileList = ref<UploadProps['fileList']>([]);
@@ -152,10 +152,12 @@ const handleFolderSelect = (event: Event) => {
 };
 
 const handleRemove: UploadProps['onRemove'] = file => {
+  if (uploadState.value !== 'idle') return false;
   const index = fileList.value!.indexOf(file);
   const newFiles = fileList.value!.slice();
   newFiles.splice(index, 1);
   fileList.value = newFiles;
+  isFolderUpload.value = newFiles.length > 1 || isFolderLike(newFiles);
 };
 
 const beforeUpload: UploadProps['beforeUpload'] = (file) => {
@@ -291,14 +293,19 @@ const processEntry = (entry: FileSystemEntry) => {
         const pathParts = cleanPath.split('/').filter(Boolean);
         // Only keep relative path when a real folder structure exists.
         const fileWithPath = pathParts.length > 1
-          ? Object.assign(file, { webkitRelativePath: cleanPath })
+          ? Object.defineProperty(file, 'webkitRelativePath', { value: cleanPath })
           : file;
         addFileToList(fileWithPath as any);
       });
     }
   } else if (entry.isDirectory) {
     const reader = (entry as FileSystemDirectoryEntry).createReader();
-    reader.readEntries((entries: FileSystemEntry[]) => entries.forEach(processEntry));
+    const readBatch = () => reader.readEntries((entries: FileSystemEntry[]) => {
+      if (entries.length === 0) return;
+      entries.forEach(processEntry);
+      readBatch();
+    });
+    readBatch();
   }
 };
 
@@ -335,7 +342,7 @@ const getAccessId = async () => {
       return;
     }
     const { data, response } = await fetchJsonWithRetry<{ success?: boolean; data?: { id: string } }>(
-      `/api/fileflow/id?file_name=${fileToUpload.name}&file_size=${fileSize}`,
+      `/api/fileflow/id?${new URLSearchParams({ file_name: fileToUpload.name, file_size: String(fileSize) })}`,
       { method: 'get' },
       { timeoutMs: 12000, retries: 2 },
     );
@@ -363,7 +370,7 @@ const postSignal = async (payload: { role: 'sender' | 'receiver'; type: string; 
   if (!accessId.value) {
     throw new Error('ID 为空，无法发送信令');
   }
-  await fetchWithRetry(
+  const response = await fetchWithRetry(
     `/api/fileflow/${accessId.value}/signal`,
     {
       method: 'POST',
@@ -372,6 +379,7 @@ const postSignal = async (payload: { role: 'sender' | 'receiver'; type: string; 
     },
     { timeoutMs: 6000, retries: 2 },
   );
+  if (!response.ok) throw new Error(`信令发送失败: ${response.status}`);
 };
 
 const getSignals = async (role: 'sender' | 'receiver', since: number) => {
@@ -394,7 +402,7 @@ const resetUpload = (by_error: boolean) => {
   uploadState.value = 'idle';
   accessId.value = null;
   zipFile.value = null;
-  isFolderUpload.value = false;
+  isFolderUpload.value = by_error && ((fileList.value?.length || 0) > 1 || isFolderLike(fileList.value));
   if (!by_error) {
     fileList.value = [];
   }
@@ -410,6 +418,9 @@ const uploadViaP2P = async (nativeFile: File, config: P2pConfig) => {
   let pollActive = true;
   let channelOpen = false;
   let shouldCleanup = false;
+  let transferError: Error | null = null;
+  let acknowledged = false;
+  const pendingCandidates: RTCIceCandidateInit[] = [];
 
   const pc = new RTCPeerConnection({ iceServers });
   const channel = pc.createDataChannel('file', { ordered: true });
@@ -432,6 +443,8 @@ const uploadViaP2P = async (nativeFile: File, config: P2pConfig) => {
         return;
       }
       const timer = setTimeout(() => {
+        channel.removeEventListener('open', handleOpen);
+        channel.removeEventListener('error', handleError);
         reject(new Error('P2P 连接超时'));
       }, P2P_CONNECT_TIMEOUT_MS);
 
@@ -453,28 +466,31 @@ const uploadViaP2P = async (nativeFile: File, config: P2pConfig) => {
       channel.addEventListener('error', handleError);
     });
 
-  const waitForBufferLow = () =>
-    new Promise<void>((resolve) => {
-      if (channel.bufferedAmount < P2P_MAX_BUFFERED_AMOUNT) {
-        resolve();
-        return;
+  const waitForBufferLow = async () => {
+    const deadline = Date.now() + 30000;
+    while (channel.bufferedAmount >= P2P_MAX_BUFFERED_AMOUNT) {
+      if (transferError) throw transferError;
+      if (channel.readyState !== 'open' || Date.now() >= deadline) {
+        throw new Error('P2P 发送中断或超时');
       }
-      const handleLow = () => {
-        channel.removeEventListener('bufferedamountlow', handleLow);
-        resolve();
-      };
-      channel.addEventListener('bufferedamountlow', handleLow);
-    });
+      await sleep(50);
+    }
+    if (transferError) throw transferError;
+  };
 
   const handleSignal = async (msg: SignalMessage) => {
     if (msg.msg_type === 'answer' && msg.data) {
       const desc = new RTCSessionDescription(msg.data);
       if (!pc.currentRemoteDescription) {
         await pc.setRemoteDescription(desc);
+        for (const candidate of pendingCandidates.splice(0)) {
+          await pc.addIceCandidate(candidate);
+        }
       }
     } else if (msg.msg_type === 'candidate' && msg.data) {
       try {
-        await pc.addIceCandidate(new RTCIceCandidate(msg.data));
+        if (!pc.remoteDescription) pendingCandidates.push(msg.data);
+        else await pc.addIceCandidate(new RTCIceCandidate(msg.data));
       } catch (error) {
         console.warn('添加 ICE 候选失败', error);
       }
@@ -485,12 +501,16 @@ const uploadViaP2P = async (nativeFile: File, config: P2pConfig) => {
 
   pc.onicecandidate = (event) => {
     if (event.candidate) {
-      void postSignal({ role: 'sender', type: 'candidate', data: event.candidate });
+      void postSignal({ role: 'sender', type: 'candidate', data: event.candidate }).catch(error => {
+        transferError = error instanceof Error ? error : new Error('ICE 信令发送失败');
+        channel.dispatchEvent(new Event('error'));
+      });
     }
   };
 
   pc.onconnectionstatechange = () => {
     if (['failed', 'disconnected', 'closed'].includes(pc.connectionState)) {
+      transferError = new Error('P2P 连接中断');
       if (!channelOpen) {
         channel.dispatchEvent(new Event('error'));
       }
@@ -502,6 +522,7 @@ const uploadViaP2P = async (nativeFile: File, config: P2pConfig) => {
       try {
         const msg = JSON.parse(event.data);
         if (msg?.type === 'done') {
+          acknowledged = true;
           message.success('接收方已完成 P2P 下载');
         }
       } catch {
@@ -514,10 +535,16 @@ const uploadViaP2P = async (nativeFile: File, config: P2pConfig) => {
     while (pollActive) {
       try {
         const signalData = await getSignals('sender', signalSeq);
-        signalSeq = signalData.latest ?? signalSeq;
         for (const msg of signalData.messages || []) {
+          if (msg.msg_type === 'fallback') {
+            transferError = new Error('接收方要求回退 HTTP');
+            channel.dispatchEvent(new Event('error'));
+            pollActive = false;
+            break;
+          }
           await handleSignal(msg);
         }
+        signalSeq = signalData.latest ?? signalSeq;
       } catch (error) {
         console.warn('获取信令失败', error);
       }
@@ -548,17 +575,18 @@ const uploadViaP2P = async (nativeFile: File, config: P2pConfig) => {
     }
 
     channel.send(JSON.stringify({ type: 'end' }));
-    pollActive = false;
-    setTimeout(() => {
-      if (channel.readyState !== 'closed') {
-        channel.close();
+    const deadline = Date.now() + 30000;
+    while (!acknowledged) {
+      if (transferError) throw transferError;
+      if (channel.readyState !== 'open' || Date.now() >= deadline) {
+        throw new Error('未收到 P2P 下载完成确认');
       }
-      if (pc.connectionState !== 'closed') {
-        pc.close();
-      }
-    }, 5000);
+      await sleep(100);
+    }
+    cleanup();
     return true;
   } catch (error) {
+    cleanup();
     try {
       await postSignal({ role: 'sender', type: 'fallback', data: { message: error instanceof Error ? error.message : 'P2P 失败' } });
     } catch {
@@ -574,13 +602,20 @@ const uploadViaP2P = async (nativeFile: File, config: P2pConfig) => {
 };
 
 const handleUpload = async () => {
+  if (uploadState.value !== 'idle') return;
+  uploadState.value = 'pending';
   // If we don't have an accessId yet, get one
   if (!accessId.value) {
     try {
       await getAccessId();
     } catch (error) {
+      resetUpload(true);
       return;
     }
+  }
+  if (!accessId.value) {
+    resetUpload(true);
+    return;
   }
 
   uploadState.value = 'pending';
@@ -703,6 +738,7 @@ const handleUpload = async () => {
     let retry: number = 0;
     // Start polling to check if download is complete
     const checkDownloadComplete = async () => {
+      retry++;
       if (retry > 20) {
         message.error('未能得知文件是否被下载完成，确认下载完成则可以关闭窗口！');
         return;

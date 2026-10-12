@@ -1,124 +1,44 @@
-// 通用的并发控制函数
+// Await both the request and its response processing before reusing a worker.
 const processWithConcurrencyLimit = async <T>(
   tasks: Array<() => Promise<T>>,
   limit: number,
-  onProgress?: (result: T) => Promise<void>
+  onProgress?: (result: T) => void | Promise<void>,
 ): Promise<void> => {
-  return new Promise(async (resolve, reject) => {
-    let activePromises = 0;
-    let currentIndex = 0;
-    let completed = 0;
-    let failed = 0;
-    const total = tasks.length;
-    const progressPromises: Promise<void>[] = [];
-
-    const processNext = async () => {
-      // If we've processed all tasks, check if we're done
-      if (currentIndex >= total) {
-        if (completed === total) {
-          try {
-            await Promise.all(progressPromises);
-          } catch (progressError) {
-            console.error("Progress callback failed:", progressError);
-          }
-          resolve();
-        }
-        return;
+  if (!Number.isInteger(limit) || limit < 1) {
+    throw new Error('Concurrency limit must be a positive integer');
+  }
+  let currentIndex = 0;
+  let failed = false;
+  let failure: unknown;
+  const worker = async () => {
+    while (!failed && currentIndex < tasks.length) {
+      const task = tasks[currentIndex++];
+      try {
+        const result = await task();
+        await onProgress?.(result);
+      } catch (error) {
+        if (!failed) failure = error;
+        failed = true;
       }
-
-      // While we have capacity and tasks to process
-      while (activePromises < limit && currentIndex < total) {
-        const taskIndex = currentIndex;
-        const task = tasks[currentIndex];
-        currentIndex++;
-        activePromises++;
-
-        // Execute the task
-        task()
-          .then(async (result) => {
-            activePromises--;
-            completed++;
-
-            // Report progress if callback is provided
-            if (onProgress) {
-              progressPromises.push(onProgress(result));
-            }
-
-            // Check if all tasks are completed
-            if (completed + failed === total) {
-              try {
-                await Promise.all(progressPromises);
-              } catch (progressError) {
-                console.error("Progress callback failed:", progressError);
-              }
-              if (failed > 0) {
-                // Some tasks failed, reject the operation
-                reject(new Error(`Some tasks failed. Total failed: ${failed}`));
-              } else {
-                resolve();
-              }
-            } else {
-              // Process next available task
-              await processNext();
-            }
-          })
-          .catch(async (error) => {
-            // Log the error and reject the entire operation
-            console.error("Task failed:", error);
-            activePromises--;
-            failed++;
-            completed++;
-
-            // Check if all tasks are completed
-            if (completed + failed === total) {
-              try {
-                await Promise.all(progressPromises);
-              } catch (progressError) {
-                console.error("Progress callback failed:", progressError);
-              }
-              if (failed > 0) {
-                // Some tasks failed, reject the operation
-                reject(new Error(`Some tasks failed. Total failed: ${failed}`));
-              } else {
-                resolve();
-              }
-            } else {
-              // Process next available task
-              await processNext();
-            }
-          });
-      }
-    };
-
-    // Start processing
-    processNext();
-  });
+    }
+  };
+  // Drain in-flight requests before callers reset transfer state.
+  await Promise.all(Array.from({ length: Math.min(limit, tasks.length) }, worker));
+  if (failed) throw failure;
 };
 
-export const processUploadWithConcurrencyLimit = async (
-  tasks: Array<() => Promise<any>>,
+export const processUploadWithConcurrencyLimit = (
+  tasks: Array<() => Promise<number>>,
   limit: number,
-  onProgress?: (seq_len: number) => void
-): Promise<void> => {
-  return processWithConcurrencyLimit(
-    tasks,
-    limit,
-    onProgress
-      ? async (seq_len: number) => onProgress(seq_len)
-      : undefined
-  );
-};
+  onProgress?: (length: number) => void | Promise<void>,
+): Promise<void> => processWithConcurrencyLimit(tasks, limit, onProgress);
 
-export const processDownloadWithConcurrencyLimit = async (
-  tasks: Array<() => Promise<any>>,
+export const processDownloadWithConcurrencyLimit = (
+  tasks: Array<() => Promise<[RegExpMatchArray, Response]>>,
   limit: number,
-  onProgress?: (range_match: RegExpMatchArray, resp: Response) => void
-): Promise<void> => {
-  return processWithConcurrencyLimit(
-    tasks,
-    limit,
-    onProgress
-      ? async ([range_match, response]: [RegExpMatchArray, Response]) => onProgress(range_match, response)
-      : undefined
-  );
-};
+  onProgress?: (range: RegExpMatchArray, response: Response) => void | Promise<void>,
+): Promise<void> => processWithConcurrencyLimit(
+  tasks,
+  limit,
+  onProgress ? ([range, response]) => onProgress(range, response) : undefined,
+);
