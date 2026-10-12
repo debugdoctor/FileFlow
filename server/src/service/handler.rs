@@ -6,7 +6,7 @@ use crate::{
     utils::nanoid,
 };
 use axum::{
-    body::Body, extract::{Multipart, Path, Query}, http::{header, StatusCode}, response::{AppendHeaders, Html, IntoResponse}, Json
+    body::Body, extract::{FromRequest, Multipart, Path, Query, Request}, http::{header, StatusCode}, response::{AppendHeaders, Html, IntoResponse}, Json
 };
 use mime_guess;
 use serde::Deserialize;
@@ -17,7 +17,6 @@ use lazy_static::lazy_static;
 lazy_static! {
     static ref MAX_BLOCK_SIZE: u64 = read_env_u64("MAX_BLOCK_SIZE", 1024 * 1024);
     static ref MAX_BLOCKS_PER_FILE: usize = read_env_usize("MAX_BLOCKS_PER_FILE", 1024);
-    static ref UPLOAD_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::new(4);
 }
 
 /// TTL for metadata entries (seconds)
@@ -130,6 +129,31 @@ pub struct BlockAck {
     pub start: u64,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct UploadAdmission {
+    pub start: u64,
+    pub length: u64,
+}
+
+pub async fn admit_upload(Path(id): Path<String>, Json(payload): Json<UploadAdmission>) -> impl IntoResponse {
+    let Some(meta) = MetaInfo::get_db().get(&id).await else {
+        return upload_error(StatusCode::NOT_FOUND, "Access ID Not Found");
+    };
+    if payload.start >= meta.value.file_size || payload.start % meta.value.block_size as u64 != 0
+        || payload.length != (meta.value.file_size - payload.start).min(meta.value.block_size as u64) {
+        return upload_error(StatusCode::BAD_REQUEST, "Invalid block range");
+    }
+    if meta.value.done {
+        return Json(json!({"success": true, "data": {"status": "complete"}})).into_response();
+    }
+    let admission = FileBlock::get_db().admit(&id, payload.start, payload.length).await;
+    Json(json!({"success": true, "data": admission})).into_response()
+}
+
+fn upload_error(status: StatusCode, message: &str) -> axum::response::Response {
+    (status, Json(json!({"code": status.as_u16(), "success": false, "message": message}))).into_response()
+}
+
 pub async fn get_transfer_config() -> impl IntoResponse {
     let cache = FileBlock::get_db();
     Json(json!({
@@ -139,6 +163,7 @@ pub async fn get_transfer_config() -> impl IntoResponse {
             "max_file_size": max_total_size(),
             "cache_bytes": cache.max_bytes,
             "window_bytes": cache.window_bytes,
+            "min_window_bytes": cache.floor_bytes,
         }
     }))
 }
@@ -582,10 +607,16 @@ pub async fn get_file(
 /// Handler for uploading file chunks
 /// Processes multipart form data with file info and chunk data
 /// Includes validation for block size and file limits
-#[instrument]
-pub async fn upload_file(Path(id): Path<String>, multipart: Multipart) -> impl IntoResponse {
-    // Bound multipart buffers as well as cached payloads.
-    let _slot = UPLOAD_SLOTS.acquire().await.unwrap();
+#[instrument(skip(request))]
+pub async fn upload_file(Path(id): Path<String>, request: Request) -> impl IntoResponse {
+    // Validate and claim admission before constructing a multipart body reader.
+    let Some(token) = request.headers().get("X-Upload-Permit").and_then(|value| value.to_str().ok()) else {
+        return upload_error(StatusCode::PRECONDITION_REQUIRED, "Upload admission required");
+    };
+    let upload = match FileBlock::get_db().begin_upload(&id, token) {
+        Ok(upload) => upload,
+        Err(message) => return upload_error(StatusCode::CONFLICT, message),
+    };
     // Changed from INFO to DEBUG to reduce log verbosity for large files
     event!(Level::DEBUG, "Starting file upload for ID: {}", id);
     
@@ -612,7 +643,10 @@ pub async fn upload_file(Path(id): Path<String>, multipart: Multipart) -> impl I
     };
 
 
-    let mut multipart = multipart;
+    let mut multipart = match Multipart::from_request(request, &()).await {
+        Ok(multipart) => multipart,
+        Err(rejection) => return rejection.into_response(),
+    };
 
     let mut filename: String = String::new();
     let mut start: u64 = 0;
@@ -712,6 +746,10 @@ pub async fn upload_file(Path(id): Path<String>, multipart: Multipart) -> impl I
         start = info.start;
         end = info.end;
         total = info.total;
+
+        if start != upload.start || end.checked_sub(start).and_then(|length| length.checked_add(1)) != Some(upload.length) {
+            return upload_error(StatusCode::BAD_REQUEST, "Block does not match upload permit");
+        }
 
         if total != metadata.file_size || start % metadata.block_size as u64 != 0
             || end != start.saturating_add(metadata.block_size as u64).min(total).saturating_sub(1) {
@@ -859,12 +897,8 @@ pub async fn upload_file(Path(id): Path<String>, multipart: Multipart) -> impl I
             total,
         );
 
-        if !metadata.done && !FileBlock::get_db().insert(&id, file_block).await {
-            return (
-                StatusCode::TOO_MANY_REQUESTS,
-                AppendHeaders([("Retry-After", "1")]),
-                Json(json!({"code": 429, "success": false, "message": "Waiting for receiver or available RAM"})),
-            ).into_response();
+        if let Err(message) = upload.commit(file_block) {
+            return upload_error(StatusCode::CONFLICT, message);
         }
         event!(Level::DEBUG, "Successfully uploaded block for '{}' range {}-{} of total {} for ID: {}", filename, start, end, total, id);
     }
@@ -1015,5 +1049,28 @@ mod tests {
             assert_eq!(response.status(), StatusCode::OK);
         }
         assert!(FileBlock::get_db().get(id, 0).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn upload_without_admission_is_rejected_before_multipart_parsing() {
+        // The body and Content-Type are deliberately invalid. Admission must be checked first.
+        let request = Request::builder().method("POST").body(Body::from("not multipart")).unwrap();
+        let response = upload_file(Path("test-no-permit".into()), request).await.into_response();
+        assert_eq!(response.status(), StatusCode::PRECONDITION_REQUIRED);
+    }
+
+    #[tokio::test]
+    async fn admission_rejects_ranges_that_do_not_match_metadata() {
+        let id = "test-admit-range";
+        MetaInfo::get_db().insert(id, MetaInfo::new("test".into(), 4), 60).await.unwrap();
+        let invalid = admit_upload(Path(id.into()), Json(UploadAdmission { start: 0, length: 5 })).await.into_response();
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        let valid = admit_upload(Path(id.into()), Json(UploadAdmission { start: 0, length: 4 })).await.into_response();
+        assert_eq!(valid.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(&to_bytes(valid.into_body(), 4096).await.unwrap()).unwrap();
+        let token = body["data"]["token"].as_str().unwrap();
+        let upload = FileBlock::get_db().begin_upload(id, token).unwrap();
+        upload.commit(FileBlock::new(&Bytes::from_static(b"test"), "test".into(), 0, 3, 4)).unwrap();
+        FileBlock::get_db().finish(id).await;
     }
 }

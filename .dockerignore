@@ -1,0 +1,13 @@
+.git
+.github
+.env
+.env.*
+**/node_modules
+**/target
+**/dist
+**/dist-ssr
+**/coverage
+**/.vscode
+**/.DS_Store
+**/*.log
+build

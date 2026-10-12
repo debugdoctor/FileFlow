@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { onMounted, onUnmounted, ref } from 'vue';
 import { Upload as UploadIcon, FileText, HardDrive, X } from 'lucide-vue-next';
-import { message, Button, Upload, Progress, Card, Typography, Space, Alert } from 'ant-design-vue';
+import { message, Button, Upload, Progress, Card, Typography, Space, Alert, InputNumber } from 'ant-design-vue';
 import type { UploadProps } from 'ant-design-vue';
 import { uploadFile, fetchJsonWithRetry, fetchWithRetry, getTransferConfig } from '@/utils/requests';
 import { processUploadWithConcurrencyLimit } from '@/utils/asyncPool';
@@ -21,10 +21,10 @@ const zipFile = ref<File | null>(null);
 
 const accessId = ref<string | null>(null);
 const uploadProgress = ref(0);
-const maxPollCount = 120; // 最多等待120秒
+const receiverWaitMinutes = ref(5);
 const uploadedLength = ref(0);
 const is_online = ref(false);
-const remainingPolls = ref(maxPollCount);
+const remainingPolls = ref(5 * 60);
 
 const intervalRef = ref<ReturnType<typeof setInterval> | undefined>(undefined)
 const uploadRef = ref<any>(null)
@@ -625,32 +625,37 @@ const handleUpload = async () => {
   uploadProgress.value = 0;
 
   message.info('正在等待接收方连接...');
-  remainingPolls.value = maxPollCount;
+  const waitMinutes = Math.min(1440, Math.max(1, Math.round(Number(receiverWaitMinutes.value) || 5)));
+  receiverWaitMinutes.value = waitMinutes;
+  const deadline = Date.now() + waitMinutes * 60000;
+  remainingPolls.value = waitMinutes * 60;
 
   try {
     // Polling to check if the access code is in use
     let isUsing = false;
-    let pollCount = 0;
-
-    while (!isUsing && pollCount < maxPollCount) {
-      const { data: statusData } = await fetchJsonWithRetry<{ success?: boolean; data?: { is_using?: boolean } }>(
-        `/api/fileflow/${accessId.value}/status`,
-        { method: 'get' },
-        { timeoutMs: 6000, retries: 2 },
-      );
-
-      // Check if is_using is true
-      if (statusData?.success && statusData.data && statusData.data.is_using) {
-        isUsing = true;
-        uploadState.value = 'processing';
-        message.success('接收方已连接，开始上传文件...');
-      } else {
-        // Wait for 1 second before checking again
-        await new Promise(resolve => setTimeout(resolve, 1000));
-        pollCount++;
-        remainingPolls.value = maxPollCount - pollCount;
-        uploadState.value = 'pending';
+    const countdown = setInterval(() => {
+      remainingPolls.value = Math.max(0, Math.ceil((deadline - Date.now()) / 1000));
+    }, 250);
+    try {
+      while (!isUsing && Date.now() < deadline) {
+        try {
+          const { data: statusData } = await fetchJsonWithRetry<{ success?: boolean; data?: { is_using?: boolean } }>(
+            `/api/fileflow/${accessId.value}/status`,
+            { method: 'get' },
+            { timeoutMs: Math.min(6000, Math.max(1, deadline - Date.now())), retries: 0 },
+          );
+          if (statusData?.success && statusData.data?.is_using) {
+            isUsing = true;
+            uploadState.value = 'processing';
+            message.success('接收方已连接，开始上传文件...');
+          }
+        } catch {
+          // A brief network interruption still counts toward the configured deadline.
+        }
+        if (!isUsing) await sleep(Math.min(1000, Math.max(0, deadline - Date.now())));
       }
+    } finally {
+      clearInterval(countdown);
     }
 
     if (!isUsing) {
@@ -689,7 +694,7 @@ const handleUpload = async () => {
         const chunkIndex = i; // 保存当前索引的快照
 
         // Allocate multipart data only when a worker can actually send it.
-        uploadPromises.push(() => {
+        uploadPromises.push(() => uploadFile(() => {
           const chunk = nativeFile.slice(start, end);
           const formData = new FormData();
           formData.append('info', JSON.stringify({
@@ -699,8 +704,8 @@ const handleUpload = async () => {
             total: fileSize,
           } as UploadInfo));
           formData.append('file', chunk);
-          return uploadFile(formData, accessId.value, chunkIndex, chunk.size);
-        });
+          return formData;
+        }, accessId.value, chunkIndex, end - start, start));
       }
 
       // Process uploads with a concurrency limit of 4
@@ -858,6 +863,14 @@ onUnmounted(() => {
             <Text type="secondary">请将此 ID 发送给文件接收方</Text>
           </div>
         </div>
+
+        <Space>
+          <label for="receiver-wait-minutes">等待接收方连接：</label>
+          <InputNumber id="receiver-wait-minutes" v-model:value="receiverWaitMinutes"
+            aria-label="等待接收方连接时间（分钟）" :min="1" :max="1440" :precision="0"
+            :disabled="uploadState !== 'idle'" />
+          <Text>分钟</Text>
+        </Space>
 
         <div class="action-buttons">
           <Button type="default" size="large" :disabled="uploadState !== 'idle'" @click="triggerFolderSelect">

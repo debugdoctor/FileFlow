@@ -1,6 +1,6 @@
-import message from "ant-design-vue/es/message";
 import type { Ref } from "vue";
 import { fetchWithTimeout } from './http';
+export { uploadFile } from './upload';
 
 const MAX_RETRIES = 4;
 const BASE_DELAY_MS = 400;
@@ -87,50 +87,6 @@ export const fetchJsonWithRetry = async <T>(
   return fetchAndConsumeWithRetry(input, init, options, async response => ({
     data: await parseJsonSafely<T>(response), response,
   }));
-};
-
-export const uploadFile = async (formData: FormData, accessId: string | null, i: number, seq_len: number): Promise<number> => {
-  let attempt = 0;
-  const capacityDeadline = Date.now() + 120000;
-
-  while (attempt <= MAX_RETRIES) {
-    try {
-      const { response, body } = await fetchWithTimeout(
-        `/api/fileflow/${accessId}/upload`,
-        { method: "post", body: formData },
-        18000,
-        async response => ({ response, body: await response.json() as { code?: number; message?: string } }),
-      );
-      if (response.status === 429 && Date.now() < capacityDeadline) {
-        await sleep(1000);
-        continue; // Cache backpressure is not a failed upload attempt.
-      }
-
-      if (!response.ok || (body && body.code !== 200)) {
-        const err = new Error(body?.message || `Upload failed for chunk ${i + 1} with status ${response.status}`);
-        (err as any).status = response.status;
-        throw err;
-      }
-
-      return seq_len;
-    } catch (error: unknown) {
-      attempt += 1;
-      const status = (error as any)?.status as number | undefined;
-      const retryable = status ? isRetryableStatus(status) : true;
-      const errMsg = error instanceof Error ? error.message : "Upload failed.";
-
-      if (attempt > MAX_RETRIES || !retryable) {
-        message.error(errMsg);
-        throw new Error(`Upload failed for chunk ${i + 1}: ${errMsg}`);
-      }
-
-      const backoff = Math.min(BASE_DELAY_MS * Math.pow(2, attempt - 1), MAX_DELAY_MS);
-      const jitter = Math.floor(Math.random() * 150);
-      await sleep(backoff + jitter);
-    }
-  }
-
-  throw new Error(`Upload failed for chunk ${i + 1} after ${MAX_RETRIES} retries`);
 };
 
 export const downloadFile = async (
