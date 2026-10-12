@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, onUnmounted, ref } from 'vue';
+import { computed, onMounted, onUnmounted, ref } from 'vue';
 import { Upload as UploadIcon, FileText, HardDrive, X } from 'lucide-vue-next';
 import { message, Button, Upload, Progress, Card, Typography, Space, Alert, InputNumber } from 'ant-design-vue';
 import type { UploadProps } from 'ant-design-vue';
@@ -20,6 +20,40 @@ const isFolderUpload = ref(false);
 const zipFile = ref<File | null>(null);
 
 const accessId = ref<string | null>(null);
+const downloadLink = computed(() => accessId.value
+  ? new URL(`/${encodeURIComponent(accessId.value)}/file`, window.location.origin).href
+  : '');
+
+const copyDownloadLink = async () => {
+  if (!downloadLink.value) return;
+  if (window.isSecureContext && navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(downloadLink.value);
+      message.success('下载链接已复制');
+      return;
+    } catch {
+      // Fall back to selection-based copying when clipboard permission is denied.
+    }
+  }
+  // Support HTTP deployments where the Clipboard API is unavailable.
+  const input = document.createElement('textarea');
+  const activeElement = document.activeElement;
+  input.value = downloadLink.value;
+  input.readOnly = true;
+  input.style.position = 'fixed';
+  input.style.left = '-9999px';
+  document.body.appendChild(input);
+  try {
+    input.select();
+    if (!document.execCommand('copy')) throw new Error('Copy failed');
+    message.success('下载链接已复制');
+  } catch {
+    message.warning('复制失败，请选中下载链接手动复制');
+  } finally {
+    input.remove();
+    if (activeElement instanceof HTMLElement) activeElement.focus();
+  }
+};
 const uploadProgress = ref(0);
 const receiverWaitMinutes = ref(5);
 const uploadedLength = ref(0);
@@ -351,20 +385,20 @@ const getAccessId = async () => {
     );
 
     if (!response.ok) {
-      const msg = (data as any)?.message || '未能获取有效的 ID';
+      const msg = (data as any)?.message || '未能生成有效的下载链接';
       throw new Error(msg);
     }
 
     if (!data?.data?.id) {
-      throw new Error('未能获取有效的 ID');
+      throw new Error('未能生成有效的下载链接');
     }
 
     accessId.value = data.data.id;
-    message.success('ID 获取成功，请将 ID 发送给接收方');
+    message.success('下载链接已生成，请发送给接收方');
     return accessId.value;
   } catch (error) {
     const msg = error instanceof Error ? error.message : '未知错误';
-    message.error(`获取 ID 失败: ${msg}`);
+    message.error(`生成下载链接失败: ${msg}`);
     throw error;
   }
 };
@@ -854,13 +888,14 @@ onUnmounted(() => {
           </div>
         </div>
 
-        <div class="access-id-section">
-          <div v-if="accessId" class="access-id-display">
-            <Text strong>接收 ID:</Text>
+        <div class="download-link-section">
+          <div v-if="downloadLink" class="download-link-display">
+            <Text strong>下载链接:</Text>
             <div class="link-container">
-              <Text>{{ accessId }}</Text>
+              <a :href="downloadLink" target="_blank" rel="noopener noreferrer">{{ downloadLink }}</a>
             </div>
-            <Text type="secondary">请将此 ID 发送给文件接收方</Text>
+            <Button size="small" @click="copyDownloadLink">复制链接</Button>
+            <p><Text type="secondary">将链接发送给接收方，打开即可进入下载页</Text></p>
           </div>
         </div>
 
@@ -882,7 +917,7 @@ onUnmounted(() => {
           <template #icon>
             <HardDrive />
           </template>
-          {{ uploadState === 'processing' ? '上传中...' : uploadState === 'pending' ? '等待对方接收' : '获取 ID 并上传' }}
+          {{ uploadState === 'processing' ? '上传中...' : uploadState === 'pending' ? '等待对方接收' : '生成链接并上传' }}
           </Button>
         </div>
 
@@ -895,8 +930,8 @@ onUnmounted(() => {
           <Title :level="5">使用说明:</Title>
           <ul>
             <li>选择或拖拽文件/文件夹；多个文件会自动打包</li>
-            <li>点击“获取 ID 并上传”，将生成的 ID 发给接收方</li>
-            <li>接收方在下载页输入 ID 后开始接收，过程中请保持此页开启</li>
+            <li>点击“生成链接并上传”，复制下载链接发给接收方</li>
+            <li>接收方打开链接后点击“开始下载”，过程中请保持此页开启</li>
           </ul>
         </div>
       </Space>
@@ -1010,12 +1045,12 @@ onUnmounted(() => {
   display: block;
 }
 
-.access-id-section {
+.download-link-section {
   width: 100%;
   text-align: center;
 }
 
-.access-id-display {
+.download-link-display {
   margin-top: 16px;
   padding: 16px;
   background-color: #f0f8ff;

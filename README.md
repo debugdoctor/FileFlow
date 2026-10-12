@@ -26,6 +26,10 @@ start /b FileFlow.exe > FileFlow.log 2>&1
 
 Open your browser and visit `http://server_ip:5000/upload` then you can upload files and follow the instructions to download files.
 
+Choose a file and click “生成链接并上传”, then copy the generated download link
+and send it to the receiver. Opening the link goes straight to that file's download
+page without entering a code. Keep the sending page open during the transfer.
+
 ## Memory usage
 
 HTTP transfers use RAM only on the server. Cached blocks and reserved uploads

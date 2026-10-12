@@ -27,7 +27,7 @@ const goDownload = () => {
               <Upload :size="28" />
               <span>我要上传</span>
             </div>
-            <Text type="secondary">生成接收 ID，与接收方点对点传输</Text>
+            <Text type="secondary">生成下载链接，分享给接收方</Text>
             <Button type="primary" size="large" block @click="goUpload">进入上传</Button>
           </Space>
         </div>
@@ -37,7 +37,7 @@ const goDownload = () => {
               <Download :size="28" />
               <span>我要下载</span>
             </div>
-            <Text type="secondary">输入 5 位 ID，开始获取文件</Text>
+            <Text type="secondary">打开分享链接即可下载，也可输入接收码</Text>
             <Button type="default" size="large" block @click="goDownload">进入下载</Button>
           </Space>
         </div>
