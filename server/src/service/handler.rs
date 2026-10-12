@@ -138,10 +138,41 @@ pub struct UploadAdmission {
     pub length: u64,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct CancelTransfer {
+    pub role: String,
+    pub sender_token: Option<String>,
+    pub rid: Option<String>,
+}
+
+pub async fn cancel_transfer(Path(id): Path<String>, Json(payload): Json<CancelTransfer>) -> impl IntoResponse {
+    let db = MetaInfo::get_db();
+    let mut store = db.store.write().await;
+    let Some(entry) = store.get_mut(&id).filter(|entry| entry.exp > Instant::now()) else {
+        return upload_error(StatusCode::NOT_FOUND, "Access ID Not Found");
+    };
+    let meta = &mut entry.value;
+    let authorized = match payload.role.as_str() {
+        "sender" => !meta.sender_token.is_empty() && payload.sender_token.as_deref() == Some(meta.sender_token.as_str()),
+        "receiver" => payload.rid.as_deref().is_some_and(|rid| !rid.is_empty() && (!meta.is_using || meta.used_by == rid)),
+        _ => false,
+    };
+    if !authorized { return upload_error(StatusCode::FORBIDDEN, "Invalid cancellation credentials"); }
+    if meta.done { return upload_error(StatusCode::CONFLICT, "Transfer already completed"); }
+    if payload.role == "receiver" && !meta.is_using {
+        meta.is_using = true;
+        meta.used_by = payload.rid.clone().unwrap();
+    }
+    if meta.cancelled_by.is_none() { meta.cancelled_by = Some(payload.role); }
+    FileBlock::get_db().finish(&id).await;
+    Json(json!({"success": true, "data": {"cancelled_by": meta.cancelled_by}})).into_response()
+}
+
 pub async fn admit_upload(Path(id): Path<String>, Json(payload): Json<UploadAdmission>) -> impl IntoResponse {
     let Some(meta) = MetaInfo::get_db().get(&id).await else {
         return upload_error(StatusCode::NOT_FOUND, "Access ID Not Found");
     };
+    if meta.value.cancelled_by.is_some() { return upload_error(StatusCode::GONE, "Transfer cancelled"); }
     if payload.start >= meta.value.file_size || payload.start % meta.value.block_size as u64 != 0
         || payload.length != (meta.value.file_size - payload.start).min(meta.value.block_size as u64) {
         return upload_error(StatusCode::BAD_REQUEST, "Invalid block range");
@@ -149,8 +180,24 @@ pub async fn admit_upload(Path(id): Path<String>, Json(payload): Json<UploadAdmi
     if meta.value.done {
         return Json(json!({"success": true, "data": {"status": "complete"}})).into_response();
     }
-    let admission = FileBlock::get_db().admit(&id, payload.start, payload.length).await;
-    Json(json!({"success": true, "data": admission})).into_response()
+    let cache = FileBlock::get_db();
+    let deadline = Instant::now() + std::time::Duration::from_millis(1500);
+    loop {
+        // Register before checking state so a concurrent acknowledgement cannot be missed.
+        let changed = cache.changed();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        if MetaInfo::get_db().get(&id).await.is_some_and(|entry| entry.value.cancelled_by.is_some()) {
+            return upload_error(StatusCode::GONE, "Transfer cancelled");
+        }
+        let admission = cache.admit(&id, payload.start, payload.length).await;
+        if matches!(admission, crate::dao::block_cache::Admission::Waiting { .. }) && Instant::now() < deadline {
+            if tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), changed).await.is_ok() {
+                continue;
+            }
+        }
+        return Json(json!({"success": true, "data": admission})).into_response();
+    }
 }
 
 fn upload_error(status: StatusCode, message: &str) -> axum::response::Response {
@@ -177,6 +224,7 @@ pub async fn acknowledge_block(Path(id): Path<String>, Json(ack): Json<BlockAck>
     let Some(meta) = MetaInfo::get_db().get(&id).await else {
         return (StatusCode::NOT_FOUND, Json(json!({"success": false, "message": "Access ID Not Found"}))).into_response();
     };
+    if meta.value.cancelled_by.is_some() { return upload_error(StatusCode::GONE, "Transfer cancelled"); }
     if ack.rid.is_empty() || meta.value.used_by != ack.rid {
         return (StatusCode::BAD_REQUEST, Json(json!({"success": false, "message": "Wrong Receive ID"}))).into_response();
     }
@@ -394,7 +442,7 @@ pub async fn download() -> impl IntoResponse {
 /// Handler for generating a unique file ID
 /// Accepts file name and size as query parameters
 /// Returns a unique ID that can be used for file transfer
-#[instrument]
+#[instrument(skip(query))]
 pub async fn get_id(
     Query(query): Query<HashMap<String, String>>
 ) -> impl IntoResponse {
@@ -434,6 +482,12 @@ pub async fn get_id(
 
     let mut meta_info = MetaInfo::new(file_name, file_size);
     meta_info.block_size = transfer_chunk_size as u32;
+    if let Some(token) = query.get("sender_token") {
+        if token.len() != 64 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return upload_error(StatusCode::BAD_REQUEST, "Invalid sender token");
+        }
+        meta_info.sender_token = token.clone();
+    }
 
     match MetaInfo::get_db().insert(&id, meta_info, META_TTL_SECS).await {
         Ok(_) => {
@@ -486,6 +540,7 @@ pub async fn get_status(Path(id): Path<String>) -> impl IntoResponse {
                         "chunk_size": meta_info.value.block_size,
                         "is_using": meta_info.value.is_using,
                         "done": meta_info.value.done,
+                        "cancelled_by": meta_info.value.cancelled_by,
                     }
 
                 }))
@@ -543,6 +598,7 @@ pub async fn get_file(
 
     match MetaInfo::get_db().get(&id).await {
         Some(meta_info) => {
+            if meta_info.value.cancelled_by.is_some() { return upload_error(StatusCode::GONE, "Transfer cancelled"); }
             if meta_info.value.used_by != receive_id {
                 event!(Level::WARN, "Wrong Receive ID for ID: {}", id);
                 return (
@@ -561,10 +617,17 @@ pub async fn get_file(
     };
 
     // Retry logic for getting file block with extended retries while staying under client timeout
-    let mut retries = 0;
+    let cache = FileBlock::get_db();
+    let block_deadline = Instant::now() + std::time::Duration::from_millis(BLOCK_FETCH_MAX_RETRIES as u64 * BLOCK_FETCH_RETRY_INTERVAL);
     
     let (block_name, block_data, block_start, block_end, block_total) = loop {
-        match FileBlock::get_db().get(&id, start).await {
+        let changed = cache.changed();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        if MetaInfo::get_db().get(&id).await.is_some_and(|entry| entry.value.cancelled_by.is_some()) {
+            return upload_error(StatusCode::GONE, "Transfer cancelled");
+        }
+        match cache.get(&id, start).await {
             Some(file_block) => {
                 if file_block.start > start {
                     event!(Level::WARN, "Wrong start position for ID: {} and start: {}", id.clone(), start);
@@ -582,7 +645,7 @@ pub async fn get_file(
                 break (file_block.filename, file_block.data, file_block.start, file_block.end, file_block.total);
             },
             None => {
-                if retries >= BLOCK_FETCH_MAX_RETRIES {
+                if Instant::now() >= block_deadline {
                     event!(Level::WARN, "Block {}:{:012} not ready after {} retries", &id, start, BLOCK_FETCH_MAX_RETRIES);
                     return (
                         StatusCode::TOO_EARLY,
@@ -594,8 +657,7 @@ pub async fn get_file(
                     )
                     .into_response();
                 }
-                retries += 1;
-                tokio::time::sleep(tokio::time::Duration::from_millis(BLOCK_FETCH_RETRY_INTERVAL)).await;
+                let _ = tokio::time::timeout(block_deadline.saturating_duration_since(Instant::now()).min(std::time::Duration::from_millis(BLOCK_FETCH_RETRY_INTERVAL)), changed).await;
             }
         }
     };
@@ -638,6 +700,7 @@ pub async fn upload_file(Path(id): Path<String>, request: Request) -> impl IntoR
     // Allow upload even if receiver hasn't connected yet; only require a valid ID.
     let metadata = match MetaInfo::get_db().get(&id).await {
         Some(meta_info) => {
+            if meta_info.value.cancelled_by.is_some() { return upload_error(StatusCode::GONE, "Transfer cancelled"); }
             if !meta_info.value.is_using {
                 event!(Level::DEBUG, "Receiver not connected yet for ID: {}", id);
             }
@@ -915,6 +978,9 @@ pub async fn upload_file(Path(id): Path<String>, request: Request) -> impl IntoR
         if let Err(message) = upload.commit(file_block) {
             return upload_error(StatusCode::CONFLICT, message);
         }
+        if MetaInfo::get_db().get(&id).await.is_some_and(|entry| entry.value.cancelled_by.is_some()) {
+            return upload_error(StatusCode::GONE, "Transfer cancelled");
+        }
         event!(Level::DEBUG, "Successfully uploaded block for '{}' range {}-{} of total {} for ID: {}", filename, start, end, total, id);
     }
 
@@ -930,48 +996,13 @@ pub async fn upload_file(Path(id): Path<String>, request: Request) -> impl IntoR
 /// Updates the metadata to indicate successful download
 #[instrument]
 pub async fn done(Path(id): Path<String>, Json(_payload): Json<serde_json::Value>) -> impl IntoResponse {
-    // Mark download as complete for the given ID
-    match MetaInfo::get_db().get(&id).await {
-        Some(mut meta_info) => {
-            meta_info.value.done = true;
-            match MetaInfo::get_db().update(&id, meta_info.value, meta_info.exp).await {
-                Ok(_) => {
-                    FileBlock::get_db().finish(&id).await;
-                    event!(Level::DEBUG, "Download marked as complete for ID: {}", id);
-                    (
-                        StatusCode::OK,
-                        Json(json!({
-                            "code": 200,
-                            "success": true,
-                            "message": "Download completion marked successfully"
-                        }))
-                    )
-                },
-                Err(e) => {
-                    event!(Level::ERROR, "Failed to update download completion status: {}", e);
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({
-                            "code": 500,
-                            "success": false,
-                            "message": "Internal Server Error"
-                        }))
-                    )
-                }
-            }
-        },
-        None => {
-            event!(Level::WARN, "ID not found for download completion: {}", id);
-            (
-                StatusCode::NOT_FOUND,
-                Json(json!({
-                    "code": 404,
-                    "success": false,
-                    "message": "Not Found"
-                }))
-            )
-        }
-    }
+    let db = MetaInfo::get_db();
+    let mut store = db.store.write().await;
+    let Some(entry) = store.get_mut(&id) else { return upload_error(StatusCode::NOT_FOUND, "Not Found"); };
+    if entry.value.cancelled_by.is_some() { return upload_error(StatusCode::GONE, "Transfer cancelled"); }
+    entry.value.done = true;
+    FileBlock::get_db().finish(&id).await;
+    Json(json!({"code": 200, "success": true, "message": "Download completion marked successfully"})).into_response()
 }
 
 /// Handler for serving static assets
@@ -1116,5 +1147,49 @@ mod tests {
             ]))).await.into_response();
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         }
+    }
+
+    #[tokio::test]
+    async fn cancellation_is_authorized_idempotent_and_releases_cached_blocks() {
+        let id = "test-cancel-transfer";
+        let mut meta = MetaInfo::new("test".into(), 4);
+        meta.sender_token = "sender-secret".into();
+        MetaInfo::get_db().insert(id, meta, 60).await.unwrap();
+        MetaInfo::claim(id, "receiver").await.unwrap();
+        assert!(FileBlock::get_db().insert(id, FileBlock::new(&Bytes::from_static(b"test"), "test".into(), 0, 3, 4)).await);
+        let wrong = cancel_transfer(Path(id.into()), Json(CancelTransfer {
+            role: "sender".into(), sender_token: Some("wrong".into()), rid: None,
+        })).await.into_response();
+        assert_eq!(wrong.status(), StatusCode::FORBIDDEN);
+        assert!(FileBlock::get_db().get(id, 0).await.is_some());
+        for role in ["receiver", "sender", "receiver"] {
+            let response = cancel_transfer(Path(id.into()), Json(CancelTransfer {
+                role: role.into(), sender_token: Some("sender-secret".into()), rid: Some("receiver".into()),
+            })).await.into_response();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        let meta = MetaInfo::get_db().get(id).await.unwrap().value;
+        assert_eq!(meta.cancelled_by.as_deref(), Some("receiver"));
+        assert!(!meta.done);
+        assert!(FileBlock::get_db().get(id, 0).await.is_none());
+        assert!(MetaInfo::claim(id, "receiver").await.is_err());
+        let response = admit_upload(Path(id.into()), Json(UploadAdmission { start: 0, length: 4 })).await.into_response();
+        assert_eq!(response.status(), StatusCode::GONE);
+        assert_eq!(done(Path(id.into()), Json(json!({}))).await.into_response().status(), StatusCode::GONE);
+    }
+
+    #[tokio::test]
+    async fn completion_and_cancellation_cannot_both_win() {
+        let id = "test-cancel-race";
+        let mut meta = MetaInfo::new("test".into(), 4);
+        meta.sender_token = "sender-secret".into();
+        MetaInfo::get_db().insert(id, meta, 60).await.unwrap();
+        let (cancel, complete) = tokio::join!(
+            cancel_transfer(Path(id.into()), Json(CancelTransfer { role: "sender".into(), sender_token: Some("sender-secret".into()), rid: None })),
+            done(Path(id.into()), Json(json!({}))),
+        );
+        assert_ne!(cancel.into_response().status().is_success(), complete.into_response().status().is_success());
+        let meta = MetaInfo::get_db().get(id).await.unwrap().value;
+        assert_ne!(meta.done, meta.cancelled_by.is_some());
     }
 }

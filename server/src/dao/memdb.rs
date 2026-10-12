@@ -60,19 +60,6 @@ impl <T: Send + Sync + Clone + 'static> MemDB<T> {
         Ok(())
     }
 
-    pub async fn update(&self, key: &str, value: T, exp: Instant) -> Result<(), String> {
-        let entry = CacheEntry { value, exp };
-        
-        self.store
-            .write()
-            .await
-            .insert(key.to_owned(), entry);
-            
-        // Changed from DEBUG to TRACE to reduce log verbosity
-        event!(Level::TRACE, "Updated key: {}", key);
-        Ok(())
-    }
-
     pub async fn get(&self, key: &str) -> Option<CacheEntry<T>> {
         let store = self.store.read().await;
         let result = store.get(key).cloned();

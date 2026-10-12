@@ -10,7 +10,8 @@ const compile = source => {
   return `data:text/javascript;base64,${Buffer.from(outputText).toString('base64')}`;
 };
 const http = compile(await readFile(new URL('../src/utils/http.ts', import.meta.url), 'utf8'));
-const source = (await readFile(new URL('../src/utils/upload.ts', import.meta.url), 'utf8')).replace("'./http'", JSON.stringify(http));
+const control = compile((await readFile(new URL('../src/utils/transferControl.ts', import.meta.url), 'utf8')).replace("'./http'", JSON.stringify(http)));
+const source = (await readFile(new URL('../src/utils/upload.ts', import.meta.url), 'utf8')).replace("'./http'", JSON.stringify(http)).replace("'./transferControl'", JSON.stringify(control));
 const { uploadFile } = await import(compile(source));
 const json = (body, status = 200) => new Response(JSON.stringify(body), { status });
 
@@ -79,5 +80,15 @@ test('cancellation while waiting for admission never sends a body or retries', {
   try {
     await assert.rejects(uploadFile(() => { assert.fail('Multipart body must not be created'); }, 'id', 0, 4, 0, controller.signal), { name: 'AbortError' });
     assert.equal(polls, 1);
+  } finally { globalThis.fetch = original; }
+});
+
+test('server cancellation exits admission immediately without retrying', async () => {
+  const original = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async () => { calls++; return json({ success: false, message: 'Transfer cancelled' }, 410); };
+  try {
+    await assert.rejects(uploadFile(() => { assert.fail('Cancelled transfer must not send data'); }, 'id', 0, 4, 0), { name: 'PeerCancelledError' });
+    assert.equal(calls, 1);
   } finally { globalThis.fetch = original; }
 });

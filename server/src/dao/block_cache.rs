@@ -248,6 +248,7 @@ pub enum Admission {
 /// Dropping a cancelled/failed request immediately releases its slot and RAM budget.
 pub struct UploadGuard {
     state: Arc<Mutex<State>>,
+    changed: Arc<tokio::sync::Notify>,
     limits: Arc<Limits>,
     id: String,
     pub start: u64,
@@ -290,6 +291,7 @@ impl UploadGuard {
             state.blocks.insert((self.id.clone(), self.start), block);
         }
         state.schedule(Instant::now(), &self.limits);
+        self.changed.notify_waiters();
         Ok(())
     }
 }
@@ -301,12 +303,14 @@ impl Drop for UploadGuard {
         let now = Instant::now();
         state.cleanup(now, &self.limits);
         state.schedule(now, &self.limits);
+        self.changed.notify_waiters();
     }
 }
 
 /// RAM-only cache with adaptive windows and round-robin upload admission.
 pub struct BlockCache {
     state: Arc<Mutex<State>>,
+    changed: Arc<tokio::sync::Notify>,
     limits: Arc<Limits>,
     pub max_bytes: u64,
     pub window_bytes: u64,
@@ -343,6 +347,8 @@ impl BlockCache {
 
     fn with_limits(limits: Limits) -> Self {
         let state = Arc::new(Mutex::new(State::default()));
+        let changed = Arc::new(tokio::sync::Notify::new());
+        let cleanup_changed = changed.clone();
         let limits = Arc::new(limits);
         let weak = Arc::downgrade(&state);
         let cleanup_limits = limits.clone();
@@ -354,15 +360,21 @@ impl BlockCache {
                 let now = Instant::now();
                 state.cleanup(now, &cleanup_limits);
                 state.schedule(now, &cleanup_limits);
+                cleanup_changed.notify_waiters();
             }
         });
         Self {
             state,
+            changed,
             max_bytes: limits.max_bytes,
             window_bytes: limits.window,
             floor_bytes: limits.floor,
             limits,
         }
+    }
+
+    pub fn changed(&self) -> tokio::sync::futures::Notified<'_> {
+        self.changed.notified()
     }
 
     pub async fn admit(&self, id: &str, start: u64, length: u64) -> Admission {
@@ -427,7 +439,9 @@ impl BlockCache {
                 state.queue.push_back(id.to_owned());
             }
         }
+        let previous_token = state.next_token;
         state.schedule(now, &self.limits);
+        if state.next_token != previous_token { self.changed.notify_waiters(); }
         if let Some(lease) = state.transfers[id].transfer.leases.get(&start) {
             Admission::Ready {
                 token: lease.token.to_string(),
@@ -460,6 +474,7 @@ impl BlockCache {
         entry.expires = now + self.limits.ttl;
         Ok(UploadGuard {
             state: self.state.clone(),
+            changed: self.changed.clone(),
             limits: self.limits.clone(),
             id: id.to_owned(),
             start,
@@ -525,6 +540,7 @@ impl BlockCache {
         }
         transfer.progress(bytes, now, &self.limits);
         state.schedule(now, &self.limits);
+        self.changed.notify_waiters();
         Ok(())
     }
 
@@ -555,6 +571,7 @@ impl BlockCache {
         state.blocks.retain(|(key, _), _| key != id);
         state.queue.retain(|queued| queued != id);
         state.schedule(now, &self.limits);
+        self.changed.notify_waiters();
     }
 }
 
@@ -786,5 +803,45 @@ mod tests {
             transfer.progress(1, now, &limits);
         }
         assert_eq!(transfer.window, limits.floor);
+    }
+
+    #[tokio::test]
+    async fn cancellation_releases_cached_and_reserved_bytes_without_recreating_late_blocks() {
+        let cache = BlockCache::with_limits(test_limits(4));
+        let token = ready(cache.admit("reading", 0, 4).await);
+        let reader = cache.begin_upload("reading", &token).unwrap();
+        ready(cache.admit("unused", 0, 4).await);
+        assert!(cache.insert("cached", block(0)).await);
+        assert_eq!(cache.state.lock().unwrap().bytes, 12);
+        cache.finish("reading").await;
+        cache.finish("unused").await;
+        cache.finish("cached").await;
+        assert_eq!(cache.state.lock().unwrap().bytes, 4);
+        reader.commit(block(0)).unwrap();
+        assert_eq!(cache.state.lock().unwrap().bytes, 0);
+        assert_eq!(cache.state.lock().unwrap().slots(), 0);
+        assert!(cache.get("reading", 0).await.is_none());
+        assert!(cache.get("cached", 0).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn waiting_requests_are_woken_when_capacity_or_blocks_change() {
+        let cache = BlockCache::with_limits(test_limits(1));
+        let token = ready(cache.admit("a", 0, 4).await);
+        let upload = cache.begin_upload("a", &token).unwrap();
+        assert!(matches!(cache.admit("b", 0, 4).await, Admission::Waiting { .. }));
+        let notification = cache.changed();
+        tokio::pin!(notification);
+        notification.as_mut().enable();
+        drop(upload);
+        tokio::time::timeout(Duration::from_millis(100), notification).await.unwrap();
+        let token = ready(cache.admit("b", 0, 4).await);
+        let upload = cache.begin_upload("b", &token).unwrap();
+        let notification = cache.changed();
+        tokio::pin!(notification);
+        notification.as_mut().enable();
+        upload.commit(block(0)).unwrap();
+        tokio::time::timeout(Duration::from_millis(100), notification).await.unwrap();
+        assert!(cache.get("b", 0).await.is_some());
     }
 }

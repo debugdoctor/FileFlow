@@ -1,4 +1,5 @@
 import { fetchWithTimeout, waitWithSignal } from './http';
+import { PeerCancelledError } from './transferControl';
 
 type Admission =
   | { status: 'ready'; token: string; expires_ms: number }
@@ -18,6 +19,7 @@ export const uploadFile = async (
         { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ start, length }), signal },
         6000,
         async response => {
+          if (response.status === 410) throw new PeerCancelledError();
           const payload = await response.json() as { success?: boolean; message?: string; data?: Admission };
           if (!response.ok || !payload.success || !payload.data) {
             const error = new Error(payload.message || `Admission failed: ${response.status}`);
@@ -44,6 +46,7 @@ export const uploadFile = async (
         },
       );
       if (response.status === 409) continue; // Expired or already consumed; re-check admission.
+      if (response.status === 410) throw new PeerCancelledError();
       if (!response.ok || response.payload.code !== 200) {
         const error = new Error(response.payload.message || `Upload failed: ${response.status}`);
         Object.assign(error, { status: response.status });
@@ -51,6 +54,7 @@ export const uploadFile = async (
       }
       return length;
     } catch (error) {
+      if (error instanceof PeerCancelledError) throw error;
       if (signal?.aborted) throw error;
       failures++;
       const status = (error as { status?: number })?.status;

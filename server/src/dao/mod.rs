@@ -1,3 +1,3 @@
 pub mod db;
 pub(crate) mod memdb;
-mod block_cache;
+pub(crate) mod block_cache;

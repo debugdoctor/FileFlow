@@ -6,6 +6,7 @@ import { downloadFile, acknowledgeBlock, fetchJsonWithRetry, fetchWithRetry } fr
 import { processDownloadWithConcurrencyLimit } from '@/utils/asyncPool';
 import { DownloadSink, FileSaveError, type FileWriter } from '@/utils/downloadSink';
 import { useTransferRate, formatRate } from '@/utils/useTransferRate';
+import { cancelTransfer, PeerCancelledError, watchTransfer } from '@/utils/transferControl';
 
 const { Title, Text } = Typography;
 
@@ -15,9 +16,17 @@ const isFinished = ref(false);
 const isStopping = ref(false);
 const downloadStopped = ref(false);
 let downloadController: AbortController | null = null;
+let stopWatchingTransfer: (() => void) | undefined;
+const peerCancelled = ref(false);
+const notifyDownloadCancelled = () => {
+  if (activeFileId.value) void cancelTransfer(activeFileId.value, 'receiver', localStorage.getItem('rid') || '').catch(() => {
+    message.warning('本端已停止，但无法通知对方，请检查网络');
+  });
+};
 const stopDownload = () => {
   if (!downloadController || isStopping.value) return;
   isStopping.value = true;
+  notifyDownloadCancelled();
   downloadController.abort(new DOMException('下载已停止', 'AbortError'));
   void sink?.abort();
   speed.stop();
@@ -544,6 +553,7 @@ const handleGetFile = async () => {
       });
     } catch (error) {
       if (controller.signal.aborted) throw error;
+      if (error instanceof PeerCancelledError) throw error;
       if (error instanceof FileSaveError) throw error;
       throw new Error('下载过程中发生错误: ' + (error instanceof Error ? error.message : '未知错误'));
     }
@@ -644,7 +654,9 @@ const handleGetFile = async () => {
     await downloadViaHttp();
   } catch (error) {
     if (controller.signal.aborted) throw error;
+    if (error instanceof PeerCancelledError) throw error;
     if (error instanceof FileSaveError) {
+      notifyDownloadCancelled();
       await activeSink.abort();
       sink = null;
       pendingAcks.clear();
@@ -656,7 +668,9 @@ const handleGetFile = async () => {
     isDownloading.value = false;
   }
   } catch (error) {
+    if (error instanceof PeerCancelledError) controller.abort(error);
     if (controller.signal.reason instanceof FileSaveError) {
+      notifyDownloadCancelled();
       await sink?.abort();
       sink = null;
       pendingAcks.clear();
@@ -667,7 +681,8 @@ const handleGetFile = async () => {
       sink = null;
       pendingAcks.clear();
       downloadStopped.value = true;
-      message.info('下载已停止。如需重新传输，请让发送方生成新链接');
+      peerCancelled.value = controller.signal.reason instanceof PeerCancelledError;
+      message.info(peerCancelled.value ? '对方已停止传输' : '下载已停止。如需重新传输，请让发送方生成新链接');
     } else message.error(error instanceof Error ? error.message : '下载失败');
   } finally {
     speed.stop();
@@ -678,6 +693,7 @@ const handleGetFile = async () => {
 }
 
 onUnmounted(() => {
+  stopWatchingTransfer?.();
   downloadController?.abort();
   void sink?.abort();
 });
@@ -697,6 +713,15 @@ onMounted(async () => {
   }
 
   activeFileId.value = segments[0];
+  stopWatchingTransfer = watchTransfer(activeFileId.value, 'receiver', () => {
+    if (isFinished.value || peerCancelled.value || downloadStopped.value) return;
+    peerCancelled.value = true;
+    downloadStopped.value = true;
+    speed.stop();
+    void sink?.abort();
+    if (downloadController) downloadController.abort(new PeerCancelledError());
+    else message.info('对方已停止传输');
+  });
 
   // Get the file info from status API
   try {
@@ -784,7 +809,7 @@ onMounted(async () => {
           <template #icon><Square :size="18" :stroke-width="1.8" /></template>
         </Button>
         </div>
-        <Text v-if="downloadStopped" type="secondary">如需重新传输，请让发送方生成新链接。</Text>
+        <Text v-if="downloadStopped" type="secondary">{{ peerCancelled ? '对方已停止传输。如需重新传输，请使用新链接。' : '如需重新传输，请让发送方生成新链接。' }}</Text>
 
         <div v-if="!isFinished" class="save-mode">
           <label v-if="canStream"><input type="checkbox" :checked="saveMode === 'stream'" :disabled="isDownloading || !!sink"

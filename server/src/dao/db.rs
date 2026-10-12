@@ -15,6 +15,8 @@ pub struct MetaInfo {
     pub file_name: String,
     pub file_size: u64,
     pub done: bool,
+    pub cancelled_by: Option<String>,
+    pub sender_token: String,
 }
 
 impl MetaInfo {
@@ -27,6 +29,7 @@ impl MetaInfo {
         let mut store = db.store.write().await;
         let entry = store.get_mut(id).filter(|entry| entry.exp > std::time::Instant::now())
             .ok_or("Access ID Not Found")?;
+        if entry.value.cancelled_by.is_some() { return Err("Transfer cancelled"); }
         if entry.value.is_using && entry.value.used_by != receiver {
             return Err("File already in use");
         }
@@ -50,6 +53,8 @@ impl MetaInfo {
             file_name: file_name,
             file_size: file_size,
             done: false,
+            cancelled_by: None,
+            sender_token: String::new(),
         }
     }
 }

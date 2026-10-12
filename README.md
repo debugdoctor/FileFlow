@@ -81,6 +81,18 @@ Both transfer pages provide a stop button. Stopping cancels active requests,
 retry waits, and P2P connections. A stopped streaming download aborts its unfinished
 file write; start a new transfer link to download again because acknowledged blocks
 may already have been released from the server.
+Stopping also posts an authenticated cancellation to the server independently of
+the local aborted requests. The peer checks status every 700ms while the page is
+open and stops on cancellation (network delays may extend this). The server clears
+cached blocks and unused upload reservations immediately; active body readers keep
+their budget only until those requests exit. Repeated cancellations are safe and
+cannot overwrite a completed transfer. Terminal upload and disk-write failures also
+request cleanup. Recoverable download failures keep blocks for same-page retries;
+if cancellation cannot reach the server or a browser crashes, cache inactivity TTL
+and 30-second unused-permit expiry remain the cleanup fallback.
+Admission requests wait up to 1.5 seconds for a cache-change notification before
+asking the client to retry. Block downloads are also woken as soon as data arrives,
+avoiding fixed polling gaps while retaining the same RAM budget and fair scheduler.
 
 ## Docker
 

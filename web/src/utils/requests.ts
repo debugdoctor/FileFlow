@@ -1,5 +1,6 @@
 import type { Ref } from "vue";
 import { fetchWithTimeout, waitWithSignal } from './http';
+import { PeerCancelledError } from './transferControl';
 export { uploadFile } from './upload';
 
 const MAX_RETRIES = 4;
@@ -102,6 +103,7 @@ export const downloadFile = async (
         async (response): Promise<[RegExpMatchArray, ArrayBuffer]> => {
           if (response.status !== 206) {
             await response.body?.cancel();
+            if (response.status === 410) throw new PeerCancelledError();
             const err = new Error(`Download failed with status ${response.status}`);
             (err as any).status = response.status;
             throw err;
@@ -132,6 +134,7 @@ export const downloadFile = async (
         },
       );
     } catch (error: unknown) {
+      if (error instanceof PeerCancelledError) throw error;
       if (signal?.aborted) throw error;
       attempt += 1;
       const status = (error as any)?.status as number | undefined;
@@ -157,6 +160,7 @@ export const acknowledgeBlock = async (fileId: string, start: number, signal?: A
       body: JSON.stringify({ rid: localStorage.getItem('rid'), start }), signal },
     { timeoutMs: 6000, retries: 4 },
   );
+  if (response.status === 410) throw new PeerCancelledError();
   if (!response.ok || !data?.success) throw new Error('无法确认文件分块，请重试');
 };
 

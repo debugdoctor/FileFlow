@@ -8,6 +8,7 @@ import { processUploadWithConcurrencyLimit } from '@/utils/asyncPool';
 import JSZip from 'jszip';
 import { useTransferRate, formatRate } from '@/utils/useTransferRate';
 import { waitWithSignal } from '@/utils/http';
+import { cancelTransfer, createSenderToken, PeerCancelledError, watchTransfer } from '@/utils/transferControl';
 
 let chunkSize = 1024 * 1024;
 let maxTotalSize = chunkSize * 10240;
@@ -21,9 +22,17 @@ const uploadState = ref<'idle' | 'pending' | 'processing' | 'finished'>('idle');
 const isStopping = ref(false);
 let uploadController: AbortController | null = null;
 let completionTimer: ReturnType<typeof setTimeout> | undefined;
+let senderToken = '';
+let stopWatchingTransfer: (() => void) | undefined;
+const notifyUploadCancelled = () => {
+  if (accessId.value && senderToken) void cancelTransfer(accessId.value, 'sender', senderToken).catch(() => {
+    message.warning('本端已停止，但无法通知对方，请检查网络');
+  });
+};
 const stopUpload = () => {
   if (!uploadController || isStopping.value) return;
   isStopping.value = true;
+  notifyUploadCancelled();
   uploadController.abort(new DOMException('上传已停止', 'AbortError'));
   speed.stop();
 };
@@ -411,7 +420,7 @@ const getAccessId = async () => {
       return;
     }
     const { data, response } = await fetchJsonWithRetry<{ success?: boolean; data?: { id: string } }>(
-      `/api/fileflow/id?${new URLSearchParams({ file_name: fileToUpload.name, file_size: String(fileSize), chunk_size: String(chunkSize) })}`,
+      `/api/fileflow/id?${new URLSearchParams({ file_name: fileToUpload.name, file_size: String(fileSize), chunk_size: String(chunkSize), sender_token: senderToken })}`,
       { method: 'get', signal: uploadController?.signal },
       { timeoutMs: 12000, retries: 2 },
     );
@@ -466,6 +475,7 @@ const getSignals = async (role: 'sender' | 'receiver', since: number) => {
 };
 
 const resetUpload = (by_error: boolean) => {
+  stopWatchingTransfer?.();
   isStopping.value = false;
   if (completionTimer) clearTimeout(completionTimer);
   linkCopied.value = false;
@@ -691,6 +701,8 @@ const handleUpload = async () => {
   if (uploadState.value !== 'idle') return;
   const controller = new AbortController();
   uploadController = controller;
+  stopWatchingTransfer?.();
+  senderToken = createSenderToken();
   isStopping.value = false;
   uploadState.value = 'pending';
   // If we don't have an accessId yet, get one
@@ -707,6 +719,14 @@ const handleUpload = async () => {
     resetUpload(true);
     return;
   }
+  stopWatchingTransfer = watchTransfer(accessId.value, 'sender', () => {
+    controller.abort(new PeerCancelledError());
+    speed.stop();
+    if (uploadState.value === 'finished') {
+      resetUpload(true);
+      message.info('对方已停止传输');
+    }
+  }, controller.signal);
 
   uploadState.value = 'pending';
   uploadProgress.value = 0;
@@ -783,7 +803,9 @@ const handleUpload = async () => {
         const chunkIndex = i; // 保存当前索引的快照
 
         // Allocate multipart data only when a worker can actually send it.
-        uploadPromises.push(() => uploadFile(() => {
+        uploadPromises.push(async () => {
+          try {
+            return await uploadFile(() => {
           const chunk = nativeFile.slice(start, end);
           const formData = new FormData();
           formData.append('info', JSON.stringify({
@@ -794,7 +816,12 @@ const handleUpload = async () => {
           } as UploadInfo));
           formData.append('file', chunk);
           return formData;
-        }, accessId.value, chunkIndex, end - start, start, controller.signal));
+            }, accessId.value, chunkIndex, end - start, start, controller.signal);
+          } catch (error) {
+            if (!controller.signal.aborted) controller.abort(error);
+            throw error;
+          }
+        });
       }
 
       // Process uploads with a concurrency limit of 4
@@ -875,8 +902,12 @@ const handleUpload = async () => {
     // Start polling after a short delay
     completionTimer = setTimeout(checkDownloadComplete, 1000);
   } catch (error) {
+    if (error instanceof PeerCancelledError) controller.abort(error);
+    const peerStopped = controller.signal.reason instanceof PeerCancelledError;
+    const locallyStopped = controller.signal.reason instanceof DOMException && controller.signal.reason.name === 'AbortError';
+    if (!peerStopped && !locallyStopped) notifyUploadCancelled();
     resetUpload(true);
-    if (controller.signal.aborted) { message.info('上传已停止'); return; }
+    if (peerStopped || locallyStopped) { message.info(peerStopped ? '对方已停止传输' : '上传已停止'); return; }
     const errorMessage = error instanceof Error ? error.message : '未知错误';
     message.error("上传失败: " + errorMessage);
   }
@@ -910,6 +941,7 @@ onMounted(() => {
 });
 
 onUnmounted(() => {
+  stopWatchingTransfer?.();
   uploadController?.abort();
   if (completionTimer) clearTimeout(completionTimer);
   if (copyFeedbackTimer) clearTimeout(copyFeedbackTimer);
