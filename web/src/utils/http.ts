@@ -5,6 +5,7 @@ export const fetchWithTimeout = async <T = Response>(
   timeoutMs: number,
   consume: (response: Response) => Promise<T> = async response => response as unknown as T,
 ): Promise<T> => {
+  init.signal?.throwIfAborted();
   const controller = new AbortController();
   const abort = () => controller.abort(init.signal?.reason);
   if (init.signal?.aborted) abort();
@@ -17,4 +18,14 @@ export const fetchWithTimeout = async <T = Response>(
     clearTimeout(timeoutId);
     init.signal?.removeEventListener('abort', abort);
   }
+};
+
+export const waitWithSignal = (ms: number, signal?: AbortSignal): Promise<void> => {
+  signal?.throwIfAborted();
+  return new Promise((resolve, reject) => {
+    const cleanup = () => signal?.removeEventListener('abort', abort);
+    const timer = setTimeout(() => { cleanup(); resolve(); }, ms);
+    const abort = () => { clearTimeout(timer); cleanup(); reject(signal?.reason); };
+    signal?.addEventListener('abort', abort, { once: true });
+  });
 };

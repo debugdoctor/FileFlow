@@ -7,7 +7,7 @@ const source = await readFile(new URL('../src/utils/http.ts', import.meta.url), 
 const { outputText } = ts.transpileModule(source, {
   compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ES2022 },
 });
-const { fetchWithTimeout } = await import(`data:text/javascript;base64,${Buffer.from(outputText).toString('base64')}`);
+const { fetchWithTimeout, waitWithSignal } = await import(`data:text/javascript;base64,${Buffer.from(outputText).toString('base64')}`);
 
 test('timeout covers a stalled body after headers arrived', { timeout: 1000 }, async () => {
   const original = globalThis.fetch;
@@ -37,4 +37,24 @@ test('a completed body clears the timeout', { timeout: 1000 }, async () => {
     await new Promise(resolve => setTimeout(resolve, 40));
     assert.equal(receivedSignal.aborted, false);
   } finally { globalThis.fetch = original; }
+});
+
+test('user cancellation interrupts a body read without waiting for timeout', { timeout: 1000 }, async () => {
+  const original = globalThis.fetch;
+  const controller = new AbortController();
+  globalThis.fetch = async (_, { signal }) => new Response(new ReadableStream({ start(stream) {
+    signal.addEventListener('abort', () => stream.error(signal.reason));
+  } }));
+  try {
+    const request = fetchWithTimeout('/chunk', { signal: controller.signal }, 30000, response => response.arrayBuffer());
+    controller.abort(new DOMException('stopped', 'AbortError'));
+    await assert.rejects(request, { name: 'AbortError' });
+  } finally { globalThis.fetch = original; }
+});
+
+test('user cancellation immediately exits retry delays', { timeout: 1000 }, async () => {
+  const controller = new AbortController();
+  const waiting = waitWithSignal(30000, controller.signal);
+  controller.abort(new DOMException('stopped', 'AbortError'));
+  await assert.rejects(waiting, { name: 'AbortError' });
 });

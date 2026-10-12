@@ -1,12 +1,13 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from 'vue';
-import { Upload as UploadIcon, FileText, HardDrive, X } from 'lucide-vue-next';
+import { Upload as UploadIcon, FileText, HardDrive, X, Copy, Check, Files, Square } from 'lucide-vue-next';
 import { message, Button, Upload, Progress, Card, Typography, Space, Alert, InputNumber } from 'ant-design-vue';
 import type { UploadProps } from 'ant-design-vue';
 import { uploadFile, fetchJsonWithRetry, fetchWithRetry, getTransferConfig } from '@/utils/requests';
 import { processUploadWithConcurrencyLimit } from '@/utils/asyncPool';
 import JSZip from 'jszip';
 import { useTransferRate, formatRate } from '@/utils/useTransferRate';
+import { waitWithSignal } from '@/utils/http';
 
 let chunkSize = 1024 * 1024;
 let maxTotalSize = chunkSize * 10240;
@@ -17,6 +18,15 @@ const P2P_SIGNAL_POLL_MS = 1000;
 
 const fileList = ref<UploadProps['fileList']>([]);
 const uploadState = ref<'idle' | 'pending' | 'processing' | 'finished'>('idle');
+const isStopping = ref(false);
+let uploadController: AbortController | null = null;
+let completionTimer: ReturnType<typeof setTimeout> | undefined;
+const stopUpload = () => {
+  if (!uploadController || isStopping.value) return;
+  isStopping.value = true;
+  uploadController.abort(new DOMException('上传已停止', 'AbortError'));
+  speed.stop();
+};
 const isFolderUpload = ref(false);
 const zipFile = ref<File | null>(null);
 
@@ -24,13 +34,20 @@ const accessId = ref<string | null>(null);
 const downloadLink = computed(() => accessId.value
   ? new URL(`/${encodeURIComponent(accessId.value)}/file`, window.location.origin).href
   : '');
+const linkCopied = ref(false);
+let copyFeedbackTimer: ReturnType<typeof setTimeout> | undefined;
+const showCopyFeedback = () => {
+  linkCopied.value = true;
+  if (copyFeedbackTimer) clearTimeout(copyFeedbackTimer);
+  copyFeedbackTimer = setTimeout(() => { linkCopied.value = false; }, 2000);
+};
 
 const copyDownloadLink = async () => {
   if (!downloadLink.value) return;
   if (window.isSecureContext && navigator.clipboard?.writeText) {
     try {
       await navigator.clipboard.writeText(downloadLink.value);
-      message.success('下载链接已复制');
+      showCopyFeedback();
       return;
     } catch {
       // Fall back to selection-based copying when clipboard permission is denied.
@@ -47,7 +64,7 @@ const copyDownloadLink = async () => {
   try {
     input.select();
     if (!document.execCommand('copy')) throw new Error('Copy failed');
-    message.success('下载链接已复制');
+    showCopyFeedback();
   } catch {
     message.warning('复制失败，请选中下载链接手动复制');
   } finally {
@@ -106,7 +123,7 @@ const getP2pConfig = async (): Promise<P2pConfig> => {
   try {
     const { data, response } = await fetchJsonWithRetry<{ success?: boolean; data?: P2pConfig }>(
       '/api/fileflow/p2p-config',
-      { method: 'get' },
+      { method: 'get', signal: uploadController?.signal },
       { timeoutMs: 6000, retries: 1 },
     );
     if (response.ok && data?.success) {
@@ -226,10 +243,11 @@ const createZipFromFolder = async () => {
 
   try {
     // Generate the zip file
-    const zipBlob = await zip.generateAsync({ type: 'blob' });
+    const zipBlob = await zip.generateAsync({ type: 'blob' }, () => uploadController?.signal.throwIfAborted());
     const zipFileName = `${folderName}.zip`;
     return new File([zipBlob], zipFileName, { type: 'application/zip' });
   } catch (error) {
+    if (uploadController?.signal.aborted) throw error;
     console.error('Error creating zip file:', error);
     message.error('创建压缩文件失败');
     return null;
@@ -361,7 +379,8 @@ const getAccessId = async () => {
   }
 
   try {
-    const config = await getTransferConfig();
+    uploadController?.signal.throwIfAborted();
+    const config = await getTransferConfig(uploadController?.signal);
     chunkSize = config.chunk_size;
     maxTotalSize = config.max_file_size;
     const fileToUpload = (isFolderUpload.value ? zipFile.value : fileList.value?.[0]) as File | undefined;
@@ -382,7 +401,7 @@ const getAccessId = async () => {
     }
     const { data, response } = await fetchJsonWithRetry<{ success?: boolean; data?: { id: string } }>(
       `/api/fileflow/id?${new URLSearchParams({ file_name: fileToUpload.name, file_size: String(fileSize) })}`,
-      { method: 'get' },
+      { method: 'get', signal: uploadController?.signal },
       { timeoutMs: 12000, retries: 2 },
     );
 
@@ -399,6 +418,7 @@ const getAccessId = async () => {
     message.success('下载链接已生成，请发送给接收方');
     return accessId.value;
   } catch (error) {
+    if (uploadController?.signal.aborted) throw error;
     const msg = error instanceof Error ? error.message : '未知错误';
     message.error(`生成下载链接失败: ${msg}`);
     throw error;
@@ -415,6 +435,7 @@ const postSignal = async (payload: { role: 'sender' | 'receiver'; type: string; 
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
+      signal: uploadController?.signal,
     },
     { timeoutMs: 6000, retries: 2 },
   );
@@ -427,13 +448,17 @@ const getSignals = async (role: 'sender' | 'receiver', since: number) => {
   }
   const { data } = await fetchJsonWithRetry<{ success?: boolean; data?: { latest?: number; messages?: SignalMessage[] } }>(
     `/api/fileflow/${accessId.value}/signal?role=${role}&since=${since}`,
-    { method: 'get' },
+    { method: 'get', signal: uploadController?.signal },
     { timeoutMs: 6000, retries: 2 },
   );
   return data?.data || { latest: since, messages: [] };
 };
 
 const resetUpload = (by_error: boolean) => {
+  isStopping.value = false;
+  if (completionTimer) clearTimeout(completionTimer);
+  linkCopied.value = false;
+  if (copyFeedbackTimer) clearTimeout(copyFeedbackTimer);
   speed.stop();
   // Reset all states after upload completion
   remainingPolls.value = 0;
@@ -474,9 +499,17 @@ const uploadViaP2P = async (nativeFile: File, config: P2pConfig) => {
     }
     pc.close();
   };
+  const signal = uploadController?.signal;
+  const cancelP2P = () => {
+    transferError = new DOMException('上传已停止', 'AbortError');
+    channel.dispatchEvent(new Event('error'));
+    cleanup();
+  };
+  signal?.addEventListener('abort', cancelP2P, { once: true });
 
   const waitForChannelOpen = () =>
     new Promise<void>((resolve, reject) => {
+      if (signal?.aborted || transferError) { reject(transferError || signal?.reason); return; }
       if (channel.readyState === 'open') {
         channelOpen = true;
         resolve();
@@ -605,6 +638,7 @@ const uploadViaP2P = async (nativeFile: File, config: P2pConfig) => {
     const totalSize = nativeFile.size;
     let offset = 0;
     while (offset < totalSize) {
+      signal?.throwIfAborted();
       const chunk = nativeFile.slice(offset, offset + P2P_CHUNK_SIZE);
       const buffer = await chunk.arrayBuffer();
       channel.send(buffer);
@@ -635,6 +669,7 @@ const uploadViaP2P = async (nativeFile: File, config: P2pConfig) => {
     shouldCleanup = true;
     throw error;
   } finally {
+    signal?.removeEventListener('abort', cancelP2P);
     if (shouldCleanup) {
       cleanup();
     }
@@ -643,12 +678,16 @@ const uploadViaP2P = async (nativeFile: File, config: P2pConfig) => {
 
 const handleUpload = async () => {
   if (uploadState.value !== 'idle') return;
+  const controller = new AbortController();
+  uploadController = controller;
+  isStopping.value = false;
   uploadState.value = 'pending';
   // If we don't have an accessId yet, get one
   if (!accessId.value) {
     try {
       await getAccessId();
     } catch (error) {
+      if (controller.signal.aborted) message.info('上传已停止');
       resetUpload(true);
       return;
     }
@@ -675,10 +714,11 @@ const handleUpload = async () => {
     }, 250);
     try {
       while (!isUsing && Date.now() < deadline) {
+        controller.signal.throwIfAborted();
         try {
           const { data: statusData } = await fetchJsonWithRetry<{ success?: boolean; data?: { is_using?: boolean } }>(
             `/api/fileflow/${accessId.value}/status`,
-            { method: 'get' },
+            { method: 'get', signal: controller.signal },
             { timeoutMs: Math.min(6000, Math.max(1, deadline - Date.now())), retries: 0 },
           );
           if (statusData?.success && statusData.data?.is_using) {
@@ -687,9 +727,10 @@ const handleUpload = async () => {
             message.success('接收方已连接，开始上传文件...');
           }
         } catch {
+          controller.signal.throwIfAborted();
           // A brief network interruption still counts toward the configured deadline.
         }
-        if (!isUsing) await sleep(Math.min(1000, Math.max(0, deadline - Date.now())));
+        if (!isUsing) await waitWithSignal(Math.min(1000, Math.max(0, deadline - Date.now())), controller.signal);
       }
     } finally {
       clearInterval(countdown);
@@ -742,11 +783,12 @@ const handleUpload = async () => {
           } as UploadInfo));
           formData.append('file', chunk);
           return formData;
-        }, accessId.value, chunkIndex, end - start, start));
+        }, accessId.value, chunkIndex, end - start, start, controller.signal));
       }
 
       // Process uploads with a concurrency limit of 4
       await processUploadWithConcurrencyLimit(uploadPromises, 4, (seq_len) => {
+        controller.signal.throwIfAborted();
         uploadedLength.value += seq_len;
         uploadProgress.value = Math.round((uploadedLength.value / fileSize) * 100);
       });
@@ -763,11 +805,13 @@ const handleUpload = async () => {
     speed.start();
 
     const p2pConfig = await getP2pConfig();
+    controller.signal.throwIfAborted();
     if (hasP2pConfig(p2pConfig)) {
       try {
         message.warning('正在尝试 P2P 连接...');
         await uploadViaP2P(nativeFile, p2pConfig);
       } catch (error) {
+        controller.signal.throwIfAborted();
         message.warning('P2P 传输失败，已回退到 HTTP');
         uploadedLength.value = 0;
         uploadProgress.value = 0;
@@ -777,6 +821,7 @@ const handleUpload = async () => {
     } else {
       await uploadViaHttp();
     }
+    controller.signal.throwIfAborted();
     uploadState.value = 'finished';
     speed.stop();
     message.success('文件上传成功！等待接收方下载完成...');
@@ -784,6 +829,7 @@ const handleUpload = async () => {
     let retry: number = 0;
     // Start polling to check if download is complete
     const checkDownloadComplete = async () => {
+      if (controller.signal.aborted || uploadController !== controller) return;
       retry++;
       if (retry > 20) {
         message.error('未能得知文件是否被下载完成，确认下载完成则可以关闭窗口！');
@@ -793,31 +839,33 @@ const handleUpload = async () => {
       try {
         const { data } = await fetchJsonWithRetry<{ success?: boolean; data?: { done?: boolean } }>(
           `/api/fileflow/${accessId.value}/status`,
-          { method: 'get' },
+          { method: 'get', signal: controller.signal },
           { timeoutMs: 6000, retries: 2 },
         );
 
         if (data?.success && data.data && data.data.done) {
           message.success('接收方已下载完成！');
           // Reset everything after a short delay
-          setTimeout(() => {
+          completionTimer = setTimeout(() => {
             resetUpload(false);
           }, 1500);
         } else {
           // Continue polling every second
-          setTimeout(checkDownloadComplete, 1000);
+          completionTimer = setTimeout(checkDownloadComplete, 1000);
         }
       } catch (error) {
+        if (controller.signal.aborted) return;
         message.warning('检查下载状态时出错，但将继续尝试');
         // Continue polling even on error
-        setTimeout(checkDownloadComplete, 1000);
+        completionTimer = setTimeout(checkDownloadComplete, 1000);
       }
     };
 
     // Start polling after a short delay
-    setTimeout(checkDownloadComplete, 1000);
+    completionTimer = setTimeout(checkDownloadComplete, 1000);
   } catch (error) {
     resetUpload(true);
+    if (controller.signal.aborted) { message.info('上传已停止'); return; }
     const errorMessage = error instanceof Error ? error.message : '未知错误';
     message.error("上传失败: " + errorMessage);
   }
@@ -845,6 +893,9 @@ onMounted(() => {
 });
 
 onUnmounted(() => {
+  uploadController?.abort();
+  if (completionTimer) clearTimeout(completionTimer);
+  if (copyFeedbackTimer) clearTimeout(copyFeedbackTimer);
   if (intervalRef.value) {
     clearInterval(intervalRef.value);
   }
@@ -852,7 +903,7 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <nav class="site-nav"><a href="/" class="brand">FileFlow</a><a href="/" class="nav-back">返回首页 ↗</a></nav>
+  <nav class="site-nav"><a href="/" class="brand"><span class="brand-mark"><Files :size="23" :stroke-width="1.7" /></span>FileFlow</a><a href="/" class="nav-back">返回首页</a></nav>
   <div class="file-upload-container">
     <div class="upload-card">
       <Space direction="vertical" size="large" style="width: 100%; max-width: 600px;">
@@ -870,7 +921,7 @@ onUnmounted(() => {
         </div>
 
         <div class="file-upload-area">
-          <Upload.Dragger ref="uploadRef" :file-list="fileList" :before-upload="beforeUpload" @remove="handleRemove"
+          <Upload.Dragger v-if="uploadState === 'idle'" ref="uploadRef" :file-list="fileList" :before-upload="beforeUpload" @remove="handleRemove"
             :disabled="uploadState !== 'idle'" :multiple="true" name="file" :show-upload-list="false"
             @change="handleChange" @drop="handleDrop">
             <div class="upload-area-wrapper">
@@ -899,9 +950,15 @@ onUnmounted(() => {
           <div v-if="downloadLink" class="download-link-display">
             <Text strong>下载链接:</Text>
             <div class="link-container">
-              <a :href="downloadLink" target="_blank" rel="noopener noreferrer">{{ downloadLink }}</a>
+              <a :href="downloadLink" :title="downloadLink" target="_blank" rel="noopener noreferrer">{{ downloadLink }}</a>
+              <button type="button" class="copy-link-button" :class="{ copied: linkCopied }"
+                :aria-label="linkCopied ? '链接已复制' : '复制链接'" :title="linkCopied ? '已复制' : '复制链接'"
+                @click="copyDownloadLink">
+                <Check v-if="linkCopied" :size="18" :stroke-width="1.8" />
+                <Copy v-else :size="18" :stroke-width="1.8" />
+              </button>
             </div>
-            <Button size="small" @click="copyDownloadLink">复制链接</Button>
+            <span class="visually-hidden" role="status">{{ linkCopied ? '下载链接已复制' : '' }}</span>
             <p><Text type="secondary">将链接发送给接收方，打开即可进入下载页</Text></p>
           </div>
         </div>
@@ -925,6 +982,10 @@ onUnmounted(() => {
             <HardDrive />
           </template>
           {{ uploadState === 'processing' ? '上传中...' : uploadState === 'pending' ? '等待对方接收' : '生成链接并上传' }}
+          </Button>
+          <Button v-if="uploadState === 'pending' || uploadState === 'processing'" size="large" class="stop-transfer-button"
+            :loading="isStopping" :disabled="isStopping" aria-label="停止上传" title="停止上传" @click="stopUpload">
+            <template #icon><Square :size="18" :stroke-width="1.8" /></template>
           </Button>
         </div>
 

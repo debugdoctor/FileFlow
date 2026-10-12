@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { ref, onMounted, nextTick } from 'vue';
+import { ref, onMounted, onUnmounted, nextTick } from 'vue';
 import { Button, Progress, message, Card, Typography, Space } from 'ant-design-vue';
-import { Download, FileText, HardDrive } from 'lucide-vue-next';
+import { Download, FileText, HardDrive, Files, Square } from 'lucide-vue-next';
 import { downloadFile, acknowledgeBlock, fetchJsonWithRetry, fetchWithRetry } from '@/utils/requests';
 import { processDownloadWithConcurrencyLimit } from '@/utils/asyncPool';
 import { DownloadSink, FileSaveError, type FileWriter } from '@/utils/downloadSink';
@@ -12,6 +12,16 @@ const { Title, Text } = Typography;
 const downloadProgress = ref(0);
 const isDownloading = ref(false);
 const isFinished = ref(false);
+const isStopping = ref(false);
+const downloadStopped = ref(false);
+let downloadController: AbortController | null = null;
+const stopDownload = () => {
+  if (!downloadController || isStopping.value) return;
+  isStopping.value = true;
+  downloadController.abort(new DOMException('下载已停止', 'AbortError'));
+  void sink?.abort();
+  speed.stop();
+};
 const fileName = ref('');
 const fileSize = ref(0); // with units
 const requiresCode = ref(false);
@@ -62,7 +72,7 @@ const getP2pConfig = async (): Promise<P2pConfig> => {
   try {
     const { data, response } = await fetchJsonWithRetry<{ success?: boolean; data?: P2pConfig }>(
       '/api/fileflow/p2p-config',
-      { method: 'get' },
+      { method: 'get', signal: downloadController?.signal },
       { timeoutMs: 6000, retries: 1 },
     );
     if (response.ok && data?.success) {
@@ -104,6 +114,7 @@ const postSignal = async (payload: { role: 'sender' | 'receiver'; type: string; 
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
+      signal: downloadController?.signal,
     },
     { timeoutMs: 6000, retries: 2 },
   );
@@ -116,7 +127,7 @@ const getSignals = async (role: 'sender' | 'receiver', since: number) => {
   }
   const { data } = await fetchJsonWithRetry<{ success?: boolean; data?: { latest?: number; messages?: SignalMessage[] } }>(
     `/api/fileflow/${activeFileId.value}/signal?role=${role}&since=${since}`,
-    { method: 'get' },
+    { method: 'get', signal: downloadController?.signal },
     { timeoutMs: 6000, retries: 2 },
   );
   return data?.data || { latest: since, messages: [] };
@@ -303,8 +314,10 @@ const downloadViaP2P = async (config: P2pConfig) => {
     }
   };
 
+  let cancelChannelReady = () => {};
   const channelReady = new Promise<void>((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error('P2P 连接超时')), P2P_CONNECT_TIMEOUT_MS);
+    cancelChannelReady = () => { clearTimeout(timer); reject(new DOMException('下载已停止', 'AbortError')); };
     pc.ondatachannel = (event) => {
       dataChannel = event.channel;
       dataChannel.binaryType = 'arraybuffer';
@@ -369,6 +382,14 @@ const downloadViaP2P = async (config: P2pConfig) => {
       });
     };
   });
+  const signal = downloadController?.signal;
+  const cancelP2P = () => {
+    transferError = new DOMException('下载已停止', 'AbortError');
+    completed = true;
+    cancelChannelReady();
+    cleanup();
+  };
+  signal?.addEventListener('abort', cancelP2P, { once: true });
 
   const pollSignals = async () => {
     while (pollActive) {
@@ -393,6 +414,7 @@ const downloadViaP2P = async (config: P2pConfig) => {
   };
 
   try {
+    signal?.throwIfAborted();
     // Attach a rejection handler before posting signaling, which may outlast the timer.
     void channelReady.catch(() => {});
     await postSignal({ role: 'receiver', type: 'ready', data: {}, rid: receiverId });
@@ -424,6 +446,7 @@ const downloadViaP2P = async (config: P2pConfig) => {
     }
     throw error;
   } finally {
+    signal?.removeEventListener('abort', cancelP2P);
     if (shouldCleanup) {
       cleanup();
     }
@@ -431,7 +454,7 @@ const downloadViaP2P = async (config: P2pConfig) => {
 };
 
 const handleGetFile = async () => {
-  if (isDownloading.value || isFinished.value) return;
+  if (isDownloading.value || isFinished.value || downloadStopped.value) return;
   if (!activeFileId.value) {
     message.warning('请先输入有效的 5 位 ID');
     return;
@@ -439,7 +462,11 @@ const handleGetFile = async () => {
 
   isDownloading.value = true;
   downloadProgress.value = 0;
+  isStopping.value = false;
+  const controller = new AbortController();
+  downloadController = controller;
 
+  try {
   try {
     if (!sink) {
       if (saveMode.value === 'stream' && savePicker) {
@@ -448,7 +475,9 @@ const handleGetFile = async () => {
         sink = new DownloadSink(await handle.createWritable());
       } else sink = new DownloadSink();
     }
+    controller.signal.throwIfAborted();
   } catch (error) {
+    if (controller.signal.aborted) throw error;
     isDownloading.value = false;
     if (!(error instanceof DOMException && error.name === 'AbortError')) message.error('无法打开保存位置，请重试');
     return;
@@ -456,7 +485,6 @@ const handleGetFile = async () => {
   const activeSink = sink;
   receivedLength.value = activeSink.bytes;
   speed.start();
-  const controller = new AbortController();
 
   let start = 0;
   let downloadedBytes = activeSink.bytes;
@@ -470,7 +498,7 @@ const handleGetFile = async () => {
 
     // An acknowledgement may have failed after the body was already verified.
     for (const savedStart of pendingAcks) {
-      await acknowledgeBlock(fileId, savedStart);
+      await acknowledgeBlock(fileId, savedStart, controller.signal);
       pendingAcks.delete(savedStart);
     }
 
@@ -492,12 +520,13 @@ const handleGetFile = async () => {
     // Process downloads with a concurrency limit of 4
     try {
       await processDownloadWithConcurrencyLimit(downloadPromises, 4, async (rangeMatch: RegExpMatchArray, data: ArrayBuffer) => {
+        controller.signal.throwIfAborted();
         const rangeStart = parseInt(rangeMatch[1]);
 
         try {
           await activeSink.save(rangeStart, data);
         } catch (error) {
-          controller.abort();
+          if (error instanceof FileSaveError) controller.abort(error);
           throw error;
         }
         pendingAcks.add(rangeStart);
@@ -510,15 +539,17 @@ const handleGetFile = async () => {
         if (fileSize.value > 0) {
           downloadProgress.value = Math.round((downloadedBytes / fileSize.value) * 100);
         }
-        await acknowledgeBlock(fileId, rangeStart);
+        await acknowledgeBlock(fileId, rangeStart, controller.signal);
         pendingAcks.delete(rangeStart);
       });
     } catch (error) {
+      if (controller.signal.aborted) throw error;
       if (error instanceof FileSaveError) throw error;
       throw new Error('下载过程中发生错误: ' + (error instanceof Error ? error.message : '未知错误'));
     }
 
     // Combine all chunks and save the file
+    controller.signal.throwIfAborted();
     if (activeSink.bytes > 0) {
       try {
         const blob = await activeSink.finish(fileSize.value);
@@ -536,6 +567,8 @@ const handleGetFile = async () => {
         document.body.removeChild(a);
         URL.revokeObjectURL(url);
         }
+        isFinished.value = true;
+        isDownloading.value = false;
 
         message.success('文件下载完成!');
 
@@ -575,6 +608,7 @@ const handleGetFile = async () => {
   try {
     await postSignal({ role: 'receiver', type: 'ready', data: {}, rid: localStorage.getItem('rid') || '' });
   } catch (error) {
+    if (controller.signal.aborted) throw error;
     message.error(error instanceof Error ? error.message : '无法连接发送方');
     isDownloading.value = false;
     speed.stop();
@@ -587,6 +621,7 @@ const handleGetFile = async () => {
     try { await postSignal({ role: 'receiver', type: 'fallback', data: { message: '接收方选择边下载边保存' } }); } catch {}
   }
   const p2pConfig = !activeSink.streaming && activeSink.bytes === 0 ? await getP2pConfig() : {};
+  controller.signal.throwIfAborted();
   if (hasP2pConfig(p2pConfig)) {
     try {
       message.warning('正在尝试 P2P 连接...');
@@ -596,6 +631,7 @@ const handleGetFile = async () => {
       speed.stop();
       return;
     } catch (error) {
+      controller.signal.throwIfAborted();
       message.warning('P2P 传输失败，已回退到 HTTP');
       downloadProgress.value = 0;
       isFinished.value = false;
@@ -607,6 +643,7 @@ const handleGetFile = async () => {
   try {
     await downloadViaHttp();
   } catch (error) {
+    if (controller.signal.aborted) throw error;
     if (error instanceof FileSaveError) {
       await activeSink.abort();
       sink = null;
@@ -618,7 +655,32 @@ const handleGetFile = async () => {
     speed.stop();
     isDownloading.value = false;
   }
+  } catch (error) {
+    if (controller.signal.reason instanceof FileSaveError) {
+      await sink?.abort();
+      sink = null;
+      pendingAcks.clear();
+      downloadStopped.value = true;
+      message.error('保存失败，已取消写入。请让发送方重新生成链接后重试');
+    } else if (controller.signal.aborted) {
+      await sink?.abort();
+      sink = null;
+      pendingAcks.clear();
+      downloadStopped.value = true;
+      message.info('下载已停止。如需重新传输，请让发送方生成新链接');
+    } else message.error(error instanceof Error ? error.message : '下载失败');
+  } finally {
+    speed.stop();
+    isStopping.value = false;
+    isDownloading.value = false;
+    downloadController = null;
+  }
 }
+
+onUnmounted(() => {
+  downloadController?.abort();
+  void sink?.abort();
+});
 
 onMounted(async () => {
   if (localStorage.getItem("rid") == null || localStorage.getItem("rid") == "" || localStorage.getItem("rid") == undefined) {
@@ -664,7 +726,7 @@ onMounted(async () => {
 </script>
 
 <template>
-  <nav class="site-nav"><a href="/" class="brand">FileFlow</a><a href="/upload" class="nav-back">分享我的文件 ↗</a></nav>
+  <nav class="site-nav"><a href="/" class="brand"><span class="brand-mark"><Files :size="23" :stroke-width="1.7" /></span>FileFlow</a><a href="/upload" class="nav-back">分享我的文件</a></nav>
   <div class="download-page">
     <Card v-if="requiresCode" class="code-card">
       <Space direction="vertical" size="large" style="width: 100%">
@@ -711,13 +773,20 @@ onMounted(async () => {
           </div>
         </div>
 
-        <Button type="primary" size="large" :loading="isDownloading" :disabled="isDownloading || isFinished"
+        <div class="download-actions">
+        <Button type="primary" size="large" :loading="isDownloading" :disabled="isDownloading || isFinished || downloadStopped"
           @click="handleGetFile" class="download-button">
           <template #icon>
             <HardDrive />
           </template>
-          {{ isFinished ? '下载完成' : isDownloading ? '下载中...' : '开始下载' }}
+          {{ downloadStopped ? '下载已停止' : isFinished ? '下载完成' : isDownloading ? '下载中...' : '开始下载' }}
         </Button>
+        <Button v-if="isDownloading" size="large" class="stop-transfer-button" :loading="isStopping" :disabled="isStopping"
+          aria-label="停止下载" title="停止下载" @click="stopDownload">
+          <template #icon><Square :size="18" :stroke-width="1.8" /></template>
+        </Button>
+        </div>
+        <Text v-if="downloadStopped" type="secondary">如需重新传输，请让发送方生成新链接。</Text>
 
         <div v-if="!isFinished" class="save-mode">
           <label v-if="canStream"><input type="checkbox" :checked="saveMode === 'stream'" :disabled="isDownloading || !!sink"

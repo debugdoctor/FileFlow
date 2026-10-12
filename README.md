@@ -70,6 +70,11 @@ Senders can set how long to wait for the receiver on the upload page. The defaul
 is 5 minutes; the supported range is 1–1440 minutes. The countdown includes network
 delays and temporary disconnections.
 
+Both transfer pages provide a stop button. Stopping cancels active requests,
+retry waits, and P2P connections. A stopped streaming download aborts its unfinished
+file write; start a new transfer link to download again because acknowledged blocks
+may already have been released from the server.
+
 ## Docker
 
 ```shell

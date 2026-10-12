@@ -1,5 +1,5 @@
 import type { Ref } from "vue";
-import { fetchWithTimeout } from './http';
+import { fetchWithTimeout, waitWithSignal } from './http';
 export { uploadFile } from './upload';
 
 const MAX_RETRIES = 4;
@@ -7,8 +7,6 @@ const BASE_DELAY_MS = 400;
 const MAX_DELAY_MS = 2500;
 const DEFAULT_TIMEOUT_MS = 10000;
 const DEFAULT_RETRIES = 2;
-
-const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 const isRetryableStatus = (status: number) =>
   status === 408 || status === 425 || status === 429 || (status >= 500 && status <= 599);
@@ -57,6 +55,7 @@ const fetchAndConsumeWithRetry = async <T>(
         throw new Error(`Request failed with status ${response.status}`);
       });
     } catch (error) {
+      if (init.signal?.aborted) throw error;
       lastError = error;
       // AbortError usually means timeout; keep retrying unless we exhausted attempts.
       if (error instanceof DOMException && error.name === "AbortError" && attempt >= retries) {
@@ -69,7 +68,7 @@ const fetchAndConsumeWithRetry = async <T>(
 
     const backoff = Math.min(baseDelayMs * Math.pow(2, attempt - 1), maxDelayMs);
     const jitter = Math.floor(Math.random() * jitterMs);
-    await sleep(backoff + jitter);
+    await waitWithSignal(backoff + jitter, init.signal || undefined);
   }
 
   throw lastError instanceof Error ? lastError : new Error("Request failed after retries");
@@ -144,27 +143,27 @@ export const downloadFile = async (
 
       const backoff = Math.min(BASE_DELAY_MS * Math.pow(2, attempt - 1), MAX_DELAY_MS);
       const jitter = Math.floor(Math.random() * 150);
-      await sleep(backoff + jitter);
+      await waitWithSignal(backoff + jitter, signal);
     }
   }
 
   throw new Error(`Download failed for chunk ${start} after ${MAX_RETRIES} retries`);
 };
 
-export const acknowledgeBlock = async (fileId: string, start: number): Promise<void> => {
+export const acknowledgeBlock = async (fileId: string, start: number, signal?: AbortSignal): Promise<void> => {
   const { data, response } = await fetchJsonWithRetry<{ success?: boolean }>(
     `/api/fileflow/${fileId}/ack`,
     { method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ rid: localStorage.getItem('rid'), start }) },
+      body: JSON.stringify({ rid: localStorage.getItem('rid'), start }), signal },
     { timeoutMs: 6000, retries: 4 },
   );
   if (!response.ok || !data?.success) throw new Error('无法确认文件分块，请重试');
 };
 
-export const getTransferConfig = async (): Promise<{ chunk_size: number; max_file_size: number }> => {
+export const getTransferConfig = async (signal?: AbortSignal): Promise<{ chunk_size: number; max_file_size: number }> => {
   const { data, response } = await fetchJsonWithRetry<{
     success?: boolean; data?: { chunk_size: number; max_file_size: number };
-  }>('/api/fileflow/config');
+  }>('/api/fileflow/config', { signal });
   if (!response.ok || !data?.success || !data.data
       || !Number.isSafeInteger(data.data.chunk_size) || data.data.chunk_size <= 0
       || !Number.isSafeInteger(data.data.max_file_size) || data.data.max_file_size <= 0) {

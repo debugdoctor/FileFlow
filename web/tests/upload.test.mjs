@@ -66,3 +66,18 @@ test('expired permits are renewed before retrying an upload', { timeout: 2000 },
     assert.equal(permits, 2);
   } finally { globalThis.fetch = original; }
 });
+
+test('cancellation while waiting for admission never sends a body or retries', { timeout: 1000 }, async () => {
+  const original = globalThis.fetch;
+  const controller = new AbortController();
+  let polls = 0;
+  globalThis.fetch = async () => {
+    polls++;
+    setTimeout(() => controller.abort(new DOMException('stopped', 'AbortError')), 10);
+    return json({ success: true, data: { status: 'waiting', retry_after_ms: 2000 } });
+  };
+  try {
+    await assert.rejects(uploadFile(() => { assert.fail('Multipart body must not be created'); }, 'id', 0, 4, 0, controller.signal), { name: 'AbortError' });
+    assert.equal(polls, 1);
+  } finally { globalThis.fetch = original; }
+});
