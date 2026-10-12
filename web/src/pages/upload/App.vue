@@ -6,6 +6,7 @@ import type { UploadProps } from 'ant-design-vue';
 import { uploadFile, fetchJsonWithRetry, fetchWithRetry, getTransferConfig } from '@/utils/requests';
 import { processUploadWithConcurrencyLimit } from '@/utils/asyncPool';
 import JSZip from 'jszip';
+import { useTransferRate, formatRate } from '@/utils/useTransferRate';
 
 let chunkSize = 1024 * 1024;
 let maxTotalSize = chunkSize * 10240;
@@ -57,6 +58,7 @@ const copyDownloadLink = async () => {
 const uploadProgress = ref(0);
 const receiverWaitMinutes = ref(5);
 const uploadedLength = ref(0);
+const speed = useTransferRate(() => uploadedLength.value);
 const is_online = ref(false);
 const remainingPolls = ref(5 * 60);
 
@@ -432,6 +434,7 @@ const getSignals = async (role: 'sender' | 'receiver', since: number) => {
 };
 
 const resetUpload = (by_error: boolean) => {
+  speed.stop();
   // Reset all states after upload completion
   remainingPolls.value = 0;
   uploadProgress.value = 0;
@@ -757,6 +760,7 @@ const handleUpload = async () => {
 
     uploadedLength.value = 0;
     uploadProgress.value = 0;
+    speed.start();
 
     const p2pConfig = await getP2pConfig();
     if (hasP2pConfig(p2pConfig)) {
@@ -767,12 +771,14 @@ const handleUpload = async () => {
         message.warning('P2P 传输失败，已回退到 HTTP');
         uploadedLength.value = 0;
         uploadProgress.value = 0;
+        speed.start();
         await uploadViaHttp();
       }
     } else {
       await uploadViaHttp();
     }
     uploadState.value = 'finished';
+    speed.stop();
     message.success('文件上传成功！等待接收方下载完成...');
 
     let retry: number = 0;
@@ -846,6 +852,7 @@ onUnmounted(() => {
 </script>
 
 <template>
+  <nav class="site-nav"><a href="/" class="brand">FileFlow</a><a href="/" class="nav-back">返回首页 ↗</a></nav>
   <div class="file-upload-container">
     <div class="upload-card">
       <Space direction="vertical" size="large" style="width: 100%; max-width: 600px;">
@@ -923,7 +930,7 @@ onUnmounted(() => {
 
         <div v-if="uploadState === 'processing'" class="progress-container">
           <Progress :percent="uploadProgress" size="small" />
-          <Text type="secondary">{{ uploadProgress }}% 已上传</Text>
+          <div class="transfer-metrics"><span>{{ formatBytes(uploadedLength) }} 已发送</span><strong>{{ formatRate(speed.rate.value) }}</strong></div>
         </div>
 
         <div class="instructions">

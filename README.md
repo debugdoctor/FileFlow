@@ -51,11 +51,20 @@ and file size limit automatically.
 The default per-file limit is 10GiB (10240 chunks of 1MiB). Change
 `MAX_BLOCKS_PER_FILE` to adjust it; this does not increase the server cache budget.
 
-The receiving browser still holds the file in memory until saving it. Retrying
-on the same download page reuses verified chunks; keep that page open because
-released server blocks cannot be recovered after a page reload. No server
+On trusted HTTPS in Chrome / Edge, the receiver can choose “边下载边保存” and a
+save location before transfer starts. This mode uses bounded HTTP download workers,
+serializes disk writes, and acknowledges each block only after writing it. Network
+retries reuse written offsets without retaining the whole payload. Other browsers
+and HTTP use the compatible in-memory download mode. Both ends show a three-second
+moving transfer rate; upload rate counts accepted/queued bytes, not remote disk speed.
+Keep the download page open because released server blocks cannot be recovered
+after a page reload. Browser disk write failures require a new transfer link.
+No server
 temporary files are created; browser storage and OS swap behavior are controlled
 by the browser and operating system.
+The browser's file API may stage writes in its own temporary file until closing;
+streaming reduces application RAM use but does not promise exactly one physical
+disk write per byte.
 
 Senders can set how long to wait for the receiver on the upload page. The default
 is 5 minutes; the supported range is 1–1440 minutes. The countdown includes network
@@ -82,3 +91,22 @@ and runtime overhead. Recreate the service after changing configuration:
 ```shell
 docker compose up -d --force-recreate
 ```
+
+### LAN HTTPS
+
+Generate a private LAN CA and an IP certificate on the server:
+
+```sh
+sh deploy/create-lan-cert.sh 10.23.58.43
+docker run --rm --user 0:0 --entrypoint sh -v "$PWD/deploy/tls:/tls" alpine:3.22 \
+  -c 'chown 101:101 /tls/server.key && chmod 400 /tls/server.key'
+docker compose -p fileflow -f docker-compose.yml -f docker-compose.https.yml up -d --build
+```
+
+Use `https://10.23.58.43`. Import `deploy/tls/ca.crt` into each receiving device's
+trusted root store, verifying its SHA-256 fingerprint against the server output.
+The public CA certificate is also available at `/fileflow-ca.crt`; private keys
+stay on the server and are excluded from Git and image builds. Merely ignoring a
+browser certificate warning does not establish a trusted secure context.
+The HTTPS proxy disables request/response buffering and uses RAM for temporary
+storage. Certificates must be renewed before expiry (server certificate: one year).

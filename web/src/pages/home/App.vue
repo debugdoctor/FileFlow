@@ -14,11 +14,12 @@ const goDownload = () => {
 </script>
 
 <template>
+  <nav class="site-nav"><a href="/" class="brand">FileFlow</a><span class="nav-back">文件，让分享更简单</span></nav>
   <div class="landing">
     <div class="card">
       <div class="headline">
-        <Title :level="2">FileFlow</Title>
-        <Text type="secondary">轻量直连，快速传文件</Text>
+        <Title :level="2">分享文件，轻松一点。</Title>
+        <Text type="secondary">选好文件，发出链接。让文件顺畅抵达另一端。</Text>
       </div>
       <div class="actions">
         <div class="pane upload">

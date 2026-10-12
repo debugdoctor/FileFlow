@@ -4,6 +4,8 @@ import { Button, Progress, message, Card, Typography, Space } from 'ant-design-v
 import { Download, FileText, HardDrive } from 'lucide-vue-next';
 import { downloadFile, acknowledgeBlock, fetchJsonWithRetry, fetchWithRetry } from '@/utils/requests';
 import { processDownloadWithConcurrencyLimit } from '@/utils/asyncPool';
+import { DownloadSink, FileSaveError, type FileWriter } from '@/utils/downloadSink';
+import { useTransferRate, formatRate } from '@/utils/useTransferRate';
 
 const { Title, Text } = Typography;
 
@@ -18,7 +20,12 @@ const codeInputs = ref<Array<HTMLInputElement | null>>([]);
 const activeFileId = ref<string | null>(null);
 let chunkSize = 1024 * 1024;
 // Preserve verified chunks across button retries after their server copies are released.
-const fileData = new Map<number, ArrayBuffer>();
+let sink: DownloadSink | null = null;
+const receivedLength = ref(0);
+const speed = useTransferRate(() => receivedLength.value);
+const savePicker = (window as Window & { showSaveFilePicker?: (options: { suggestedName: string }) => Promise<{ createWritable(): Promise<FileWriter> }> }).showSaveFilePicker;
+const canStream = window.isSecureContext && typeof savePicker === 'function';
+const saveMode = ref<'stream' | 'memory'>(canStream ? 'stream' : 'memory');
 const pendingAcks = new Set<number>();
 
 const P2P_MAX_BUFFERED_AMOUNT = 8 * 1024 * 1024;
@@ -350,6 +357,7 @@ const downloadViaP2P = async (config: P2pConfig) => {
         if (event.data instanceof ArrayBuffer) {
           chunks.push(event.data);
           receivedBytes += event.data.byteLength;
+          receivedLength.value = receivedBytes;
           if (totalSize > 0) {
             downloadProgress.value = Math.round((receivedBytes / totalSize) * 100);
             if (receivedBytes > totalSize) {
@@ -432,8 +440,26 @@ const handleGetFile = async () => {
   isDownloading.value = true;
   downloadProgress.value = 0;
 
+  try {
+    if (!sink) {
+      if (saveMode.value === 'stream' && savePicker) {
+        // Must run directly inside the click gesture, before any network await.
+        const handle = await savePicker.call(window, { suggestedName: fileName.value || 'downloaded_file' });
+        sink = new DownloadSink(await handle.createWritable());
+      } else sink = new DownloadSink();
+    }
+  } catch (error) {
+    isDownloading.value = false;
+    if (!(error instanceof DOMException && error.name === 'AbortError')) message.error('无法打开保存位置，请重试');
+    return;
+  }
+  const activeSink = sink;
+  receivedLength.value = activeSink.bytes;
+  speed.start();
+  const controller = new AbortController();
+
   let start = 0;
-  let downloadedBytes = Array.from(fileData.values()).reduce((total, data) => total + data.byteLength, 0);
+  let downloadedBytes = activeSink.bytes;
   downloadProgress.value = fileSize.value > 0 ? Math.round(downloadedBytes / fileSize.value * 100) : 0;
 
   const fileId = activeFileId.value;
@@ -455,8 +481,8 @@ const handleGetFile = async () => {
 
       // Create a function that returns a promise for this chunk download
       // Pass fileId and the byte range start, but not fileName since it's not needed for the request
-      if (!fileData.has(currentStart)) {
-        downloadPromises.push(() => downloadFile(fileId, currentStart, fileName, fileSize.value, chunkEnd - currentStart + 1));
+      if (!activeSink.has(currentStart)) {
+        downloadPromises.push(() => downloadFile(fileId, currentStart, fileName, fileSize.value, chunkEnd - currentStart + 1, controller.signal));
       }
 
       if (chunkEnd === fileSize.value - 1) break;
@@ -468,11 +494,17 @@ const handleGetFile = async () => {
       await processDownloadWithConcurrencyLimit(downloadPromises, 4, async (rangeMatch: RegExpMatchArray, data: ArrayBuffer) => {
         const rangeStart = parseInt(rangeMatch[1]);
 
-        fileData.set(rangeStart, data);
+        try {
+          await activeSink.save(rangeStart, data);
+        } catch (error) {
+          controller.abort();
+          throw error;
+        }
         pendingAcks.add(rangeStart);
 
         // Update progress - 累加当前chunk的大小而不是重新计算所有chunks
         downloadedBytes += data.byteLength;
+        receivedLength.value = downloadedBytes;
 
         // Only update progress if we have a valid totalSize
         if (fileSize.value > 0) {
@@ -482,40 +514,28 @@ const handleGetFile = async () => {
         pendingAcks.delete(rangeStart);
       });
     } catch (error) {
+      if (error instanceof FileSaveError) throw error;
       throw new Error('下载过程中发生错误: ' + (error instanceof Error ? error.message : '未知错误'));
     }
 
     // Combine all chunks and save the file
-    if (fileData.size > 0) {
+    if (activeSink.bytes > 0) {
       try {
-        // Check continuity without allocating another file-sized buffer.
-        let offset = 0;
-        const sortedChunks = Array.from(fileData.entries()).sort((a, b) => a[0] - b[0]);
-
-        for (const [start, chunk] of sortedChunks) {
-          if (start !== offset) {
-            throw new Error(`文件 ${fileName.value} 中有缺失的块，请重试`);
-          }
-          offset += chunk.byteLength;
-        }
-        if (offset !== fileSize.value) throw new Error('文件大小不完整，请重试');
-
-        // Build the Blob directly from verified blocks.
-        const blob = new Blob(sortedChunks.map(([, data]) => data), { type: 'application/octet-stream' });
+        const blob = await activeSink.finish(fileSize.value);
 
         // Create a download link and trigger the download
+        if (blob) {
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url;
         a.download = fileName.value || 'downloaded_file';
         document.body.appendChild(a);
         a.click();
-        fileData.clear();
-        sortedChunks.length = 0;
 
         // Clean up
         document.body.removeChild(a);
         URL.revokeObjectURL(url);
+        }
 
         message.success('文件下载完成!');
 
@@ -540,6 +560,7 @@ const handleGetFile = async () => {
           message.warning('无法通知服务器下载完成，但文件已成功下载');
         }
       } catch (error) {
+        if (error instanceof FileSaveError) throw error;
         throw new Error('保存文件时发生错误: ' + (error instanceof Error ? error.message : '未知错误'));
       }
     } else {
@@ -556,29 +577,45 @@ const handleGetFile = async () => {
   } catch (error) {
     message.error(error instanceof Error ? error.message : '无法连接发送方');
     isDownloading.value = false;
+    speed.stop();
+    if (activeSink.bytes === 0) { await activeSink.abort(); sink = null; }
     return;
   }
 
-  const p2pConfig = fileData.size === 0 ? await getP2pConfig() : {};
+  // Streaming uses HTTP's bounded workers and per-block disk acknowledgements.
+  if (activeSink.streaming) {
+    try { await postSignal({ role: 'receiver', type: 'fallback', data: { message: '接收方选择边下载边保存' } }); } catch {}
+  }
+  const p2pConfig = !activeSink.streaming && activeSink.bytes === 0 ? await getP2pConfig() : {};
   if (hasP2pConfig(p2pConfig)) {
     try {
       message.warning('正在尝试 P2P 连接...');
       await downloadViaP2P(p2pConfig);
       isDownloading.value = false;
       isFinished.value = true;
+      speed.stop();
       return;
     } catch (error) {
       message.warning('P2P 传输失败，已回退到 HTTP');
       downloadProgress.value = 0;
       isFinished.value = false;
+      receivedLength.value = 0;
+      speed.start();
     }
   }
 
   try {
     await downloadViaHttp();
   } catch (error) {
+    if (error instanceof FileSaveError) {
+      await activeSink.abort();
+      sink = null;
+      pendingAcks.clear();
+      message.error('保存失败，已取消写入。请让发送方重新生成链接后重试');
+    }
     message.error(error instanceof Error ? error.message : '下载失败');
   } finally {
+    speed.stop();
     isDownloading.value = false;
   }
 }
@@ -627,6 +664,7 @@ onMounted(async () => {
 </script>
 
 <template>
+  <nav class="site-nav"><a href="/" class="brand">FileFlow</a><a href="/upload" class="nav-back">分享我的文件 ↗</a></nav>
   <div class="download-page">
     <Card v-if="requiresCode" class="code-card">
       <Space direction="vertical" size="large" style="width: 100%">
@@ -681,17 +719,23 @@ onMounted(async () => {
           {{ isFinished ? '下载完成' : isDownloading ? '下载中...' : '开始下载' }}
         </Button>
 
+        <div v-if="!isFinished" class="save-mode">
+          <label v-if="canStream"><input type="checkbox" :checked="saveMode === 'stream'" :disabled="isDownloading || !!sink"
+            @change="saveMode = ($event.target as HTMLInputElement).checked ? 'stream' : 'memory'" /> 边下载边保存</label>
+          <Text type="secondary">{{ canStream && saveMode === 'stream' ? '先选择保存位置，分块写入，适合大文件。' : '使用兼容下载方式，文件接收完成后保存。HTTPS 下的 Chrome / Edge 支持边下载边保存。' }}</Text>
+        </div>
+
         <div v-if="isDownloading" class="progress-container">
           <Progress :percent="downloadProgress" size="small" />
-          <Text type="secondary">{{ downloadProgress }}% 已完成</Text>
+          <div class="transfer-metrics"><span>{{ formatBytes(receivedLength) }} / {{ formatBytes(fileSize) }}</span><strong>{{ formatRate(speed.rate.value) }}</strong></div>
         </div>
 
         <div class="instructions">
           <Title :level="5">如何使用:</Title>
           <ul>
-            <li>确保分享 ID 来自可信来源</li>
+            <li>确保分享链接来自可信来源</li>
             <li>点击"开始下载"按钮开始接收文件</li>
-            <li>文件将自动保存到您的默认下载目录</li>
+            <li>支持时可选择保存位置，边下载边保存</li>
             <li>下载过程中请勿关闭此页面</li>
           </ul>
         </div>

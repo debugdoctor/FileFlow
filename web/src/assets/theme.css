@@ -1,0 +1,49 @@
+:root { font-family: Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; color: #183a36; background: #f4f7f5; }
+body { margin: 0; }
+* { box-sizing: border-box; }
+a { color: #14786a; }
+:focus-visible { outline: 3px solid #72c9b5; outline-offset: 4px; }
+.site-nav { position: absolute; top: 28px; left: max(24px, calc((100vw - 1120px) / 2)); right: max(24px, calc((100vw - 1120px) / 2)); display: flex; justify-content: space-between; align-items: center; z-index: 2; }
+.brand { font-size: 22px; font-weight: 750; letter-spacing: -1px; color: #183a36; text-decoration: none; }
+.brand::before { content: '↗'; display: inline-grid; place-items: center; width: 34px; height: 34px; margin-right: 10px; border-radius: 10px; background: #14786a; color: white; }
+.nav-back { color: #617973; font-size: 14px; text-decoration: none; }
+.landing, .file-upload-container, .download-page { background: radial-gradient(ellipse at 10% 10%, #e0eee7, transparent 45%), radial-gradient(ellipse at 90% 85%, #eaf0da, transparent 40%), #f4f7f5 !important; padding: 110px 24px 48px !important; }
+.upload-card, .download-card, .code-card, .landing > .card { border: 1px solid #e0e9e4 !important; background: #fff !important; border-radius: 24px !important; box-shadow: 0 20px 70px #244d3e0b !important; }
+.upload-card { max-width: 760px !important; padding: 34px !important; }
+.download-card { max-width: 620px !important; }
+.header { padding: 12px 0 22px !important; }
+.header h3 { font-size: 28px !important; letter-spacing: -1px; color: #183a36 !important; }
+.upload-icon, .download-icon { color: #14786a !important; background: #edf6f1; padding: 10px; width: 64px; height: 64px; border-radius: 18px; }
+.ant-btn-primary { background: #14786a !important; border-color: #14786a !important; box-shadow: none !important; }
+.ant-btn-primary:hover { background: #0d6559 !important; }
+.ant-btn-primary:disabled { background: #b7ccc5 !important; border-color: #b7ccc5 !important; color: white !important; }
+.ant-btn { border-radius: 10px !important; }
+.ant-upload-wrapper .ant-upload-drag { background: #f7faf8 !important; border: 1.5px dashed #aac7b9 !important; border-radius: 16px !important; }
+.ant-upload-wrapper .ant-upload-drag:hover { border-color: #14786a !important; }
+.ant-alert-info { background: #f2f7f4 !important; border: 1px solid #e0eae4 !important; border-radius: 12px !important; }
+.download-link-display, .file-info { background: #f0f7f3 !important; border: 1px solid #dfebe3; border-radius: 14px !important; }
+.link-container { padding: 14px !important; border: 1px solid #dbe8e0; font-family: ui-monospace, monospace; }
+.file-icon { color: #14786a !important; flex-shrink: 0; }
+.file-details { min-width: 0; overflow-wrap: anywhere; }
+.instructions { background: #f8faf8 !important; border-radius: 14px !important; padding: 20px !important; }
+.instructions li { line-height: 1.9; color: #6b7e76 !important; }
+.transfer-metrics { display: flex; justify-content: space-between; gap: 16px; margin-top: 10px; color: #6b7e76; font-variant-numeric: tabular-nums; font-size: 13px; }
+.transfer-metrics strong { color: #14786a; font-size: 16px; }
+.ant-progress-bg { background: #14786a !important; }
+.save-mode { display: grid; gap: 8px; font-size: 13px; }
+.save-mode label { font-weight: 600; color: #24584a; }
+.save-mode input { accent-color: #14786a; margin-right: 7px; }
+.code-box { background: #f6faf7; border-color: #d7e5dd !important; border-radius: 12px !important; }
+.landing > .card { max-width: 960px; padding: 52px !important; }
+.headline h2 { font-size: clamp(38px, 6vw, 60px) !important; letter-spacing: -3px; color: #183a36 !important; margin-bottom: 12px !important; }
+.headline { margin-bottom: 40px !important; }
+.pane { background: #f6faf7 !important; border: 1px solid #e0eae3 !important; border-radius: 18px !important; padding: 28px !important; }
+.pane-title { color: #24584a !important; font-size: 20px !important; }
+@media (max-width: 600px) {
+  .site-nav { top: 20px; left: 20px; right: 20px; }
+  .landing, .file-upload-container, .download-page { padding: 90px 14px 24px !important; align-items: flex-start !important; }
+  .upload-card, .landing > .card { padding: 22px !important; border-radius: 18px !important; }
+  .ant-card-body { padding: 22px !important; }
+  .action-buttons { flex-wrap: wrap; }
+  .headline h2 { letter-spacing: -2px; }
+}

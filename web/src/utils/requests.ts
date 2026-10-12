@@ -90,7 +90,7 @@ export const fetchJsonWithRetry = async <T>(
 };
 
 export const downloadFile = async (
-  fileId: string, start: number, fileName: Ref<string>, total: number, length: number,
+  fileId: string, start: number, fileName: Ref<string>, total: number, length: number, signal?: AbortSignal,
 ): Promise<[RegExpMatchArray, ArrayBuffer]> => {
   let attempt = 0;
 
@@ -98,7 +98,7 @@ export const downloadFile = async (
     try {
       return await fetchWithTimeout(
         `/api/fileflow/${fileId}/file?rid=${localStorage.getItem("rid")}&start=${start}`,
-        { method: "get" },
+        { method: "get", signal },
         18000,
         async (response): Promise<[RegExpMatchArray, ArrayBuffer]> => {
           if (response.status !== 206) {
@@ -133,6 +133,7 @@ export const downloadFile = async (
         },
       );
     } catch (error: unknown) {
+      if (signal?.aborted) throw error;
       attempt += 1;
       const status = (error as any)?.status as number | undefined;
       const retryable = status ? isRetryableStatus(status) : true;
