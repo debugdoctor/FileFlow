@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted, nextTick } from 'vue';
 import { Button, Progress, message, Card, Typography, Space } from 'ant-design-vue';
-import { Download, FileText, HardDrive, Files, Square } from 'lucide-vue-next';
+import { Download, FileText, HardDrive, Files, Square, CheckCircle2, LoaderCircle } from 'lucide-vue-next';
 import { downloadFile, acknowledgeBlock, fetchJsonWithRetry, fetchWithRetry } from '@/utils/requests';
 import { processDownloadWithConcurrencyLimit } from '@/utils/asyncPool';
 import { DownloadSink, FileSaveError, type FileWriter } from '@/utils/downloadSink';
@@ -13,6 +13,9 @@ const { Title, Text } = Typography;
 const downloadProgress = ref(0);
 const isDownloading = ref(false);
 const isFinished = ref(false);
+const isFinalizing = ref(false);
+const savedToDisk = ref(false);
+const completedAt = ref('');
 const isStopping = ref(false);
 const downloadStopped = ref(false);
 let downloadController: AbortController | null = null;
@@ -247,6 +250,8 @@ const downloadViaP2P = async (config: P2pConfig) => {
     }
     completed = true;
 
+    isFinalizing.value = true;
+    speed.stop();
     const blob = new Blob(chunks, { type: 'application/octet-stream' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -256,9 +261,13 @@ const downloadViaP2P = async (config: P2pConfig) => {
     a.click();
     chunks.length = 0;
     document.body.removeChild(a);
-    URL.revokeObjectURL(url);
+    window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
 
-    message.success('文件下载完成!');
+    savedToDisk.value = false;
+    completedAt.value = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+    isFinished.value = true;
+    isFinalizing.value = false;
+    message.success('文件接收完成，已交给浏览器保存');
 
     if (dataChannel?.readyState === 'open') {
       dataChannel.send(JSON.stringify({ type: 'done' }));
@@ -470,6 +479,7 @@ const handleGetFile = async () => {
   }
 
   isDownloading.value = true;
+  isFinalizing.value = false;
   downloadProgress.value = 0;
   isStopping.value = false;
   const controller = new AbortController();
@@ -562,6 +572,8 @@ const handleGetFile = async () => {
     controller.signal.throwIfAborted();
     if (activeSink.bytes > 0) {
       try {
+        isFinalizing.value = true;
+        speed.stop();
         const blob = await activeSink.finish(fileSize.value);
 
         // Create a download link and trigger the download
@@ -575,12 +587,15 @@ const handleGetFile = async () => {
 
         // Clean up
         document.body.removeChild(a);
-        URL.revokeObjectURL(url);
+        window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
         }
+        savedToDisk.value = activeSink.streaming;
+        completedAt.value = new Date().toLocaleTimeString('zh-CN', { hour12: false });
         isFinished.value = true;
+        isFinalizing.value = false;
         isDownloading.value = false;
 
-        message.success('文件下载完成!');
+        message.success(activeSink.streaming ? '文件已保存完成!' : '文件接收完成，已交给浏览器保存');
 
         // Send download completion signal to server
         try {
@@ -644,6 +659,7 @@ const handleGetFile = async () => {
       controller.signal.throwIfAborted();
       message.warning('P2P 传输失败，已回退到 HTTP');
       downloadProgress.value = 0;
+      isFinalizing.value = false;
       isFinished.value = false;
       receivedLength.value = 0;
       speed.start();
@@ -686,6 +702,7 @@ const handleGetFile = async () => {
     } else message.error(error instanceof Error ? error.message : '下载失败');
   } finally {
     speed.stop();
+    isFinalizing.value = false;
     isStopping.value = false;
     isDownloading.value = false;
     downloadController = null;
@@ -783,7 +800,12 @@ onMounted(async () => {
 
     <Card v-else class="download-card">
       <Space direction="vertical" size="large" style="width: 100%">
-        <div class="compact-header">
+        <div v-if="isFinished" class="completion-header" role="status" aria-live="polite">
+          <div class="completion-icon"><CheckCircle2 :size="36" :stroke-width="1.8" /></div>
+          <Title :level="3">{{ savedToDisk ? '文件已保存完成' : '文件接收完成' }}</Title>
+          <Text type="secondary">{{ savedToDisk ? '文件已保存到你选择的位置，可以放心关闭此页面。' : '已交给浏览器保存，请在浏览器下载列表中确认保存结果。' }}</Text>
+        </div>
+        <div v-else class="compact-header">
           <Title :level="3">文件下载</Title>
           <Text type="secondary">准备接收通过 FileFlow 分享的文件</Text>
         </div>
@@ -796,15 +818,15 @@ onMounted(async () => {
           </div>
         </div>
 
-        <div class="download-actions">
+        <div v-if="!isFinished" class="download-actions">
         <Button type="primary" size="large" :loading="isDownloading" :disabled="isDownloading || isFinished || downloadStopped"
           @click="handleGetFile" class="download-button">
           <template #icon>
             <HardDrive />
           </template>
-          {{ downloadStopped ? '下载已停止' : isFinished ? '下载完成' : isDownloading ? '下载中...' : '开始下载' }}
+          {{ downloadStopped ? '下载已停止' : isFinalizing ? '正在完成保存...' : isDownloading ? '下载中...' : '开始下载' }}
         </Button>
-        <Button v-if="isDownloading" size="large" class="stop-transfer-button" :loading="isStopping" :disabled="isStopping"
+        <Button v-if="isDownloading && !isFinalizing" size="large" class="stop-transfer-button" :loading="isStopping" :disabled="isStopping"
           aria-label="停止下载" title="停止下载" @click="stopDownload">
           <template #icon><Square :size="18" :stroke-width="1.8" /></template>
         </Button>
@@ -817,18 +839,30 @@ onMounted(async () => {
           <Text type="secondary">{{ canStream && saveMode === 'stream' ? '先选择保存位置，分块写入，适合大文件。' : '使用兼容下载方式，文件接收完成后保存。HTTPS 下的 Chrome / Edge 支持边下载边保存。' }}</Text>
         </div>
 
-        <div v-if="isDownloading" class="progress-container">
-          <Progress :percent="downloadProgress" size="small" />
+        <div v-if="isDownloading && !isFinished" class="progress-container">
+          <Progress :percent="downloadProgress" :status="downloadStopped ? 'exception' : 'active'" size="small" />
           <div class="transfer-metrics"><span>{{ formatBytes(receivedLength) }} / {{ formatBytes(fileSize) }}</span><strong>{{ formatRate(speed.rate.value) }}</strong></div>
+          <div v-if="isFinalizing || downloadProgress >= 100" class="finalizing-notice" role="status" aria-live="polite">
+            <LoaderCircle :size="20" class="saving-spinner" />
+            <div><strong>{{ isFinalizing ? '数据已接收，正在完成保存' : '数据已接收，正在确认传输结果' }}</strong><p>{{ isFinalizing ? '正在检查文件完整性并完成保存，大文件可能需要一些时间。请保留此页面，等待完成提示。' : '正在等待最后的分块确认，随后将完成文件保存。请保留此页面。' }}</p></div>
+          </div>
         </div>
 
-        <div class="instructions">
+        <div v-if="isFinished" class="completion-details">
+          <div class="completion-row"><span>接收大小</span><strong>{{ formatBytes(fileSize) }}</strong></div>
+          <div class="completion-row"><span>{{ savedToDisk ? '保存完成时间' : '接收完成时间' }}</span><strong>{{ completedAt }}</strong></div>
+          <div class="completion-row"><span>保存方式</span><strong>{{ savedToDisk ? '保存到所选位置' : '浏览器下载' }}</strong></div>
+          <p>{{ savedToDisk ? '打开你选择的文件夹即可查看文件。' : '打开浏览器下载列表（Windows：Ctrl + J），查看文件是否已保存完成。' }}</p>
+          <div class="completion-actions"><Button type="primary" href="/upload">分享我的文件</Button><Button href="/download">接收其他文件</Button></div>
+        </div>
+
+        <div v-else class="instructions">
           <Title :level="5">如何使用:</Title>
           <ul>
             <li>确保分享链接来自可信来源</li>
             <li>点击"开始下载"按钮开始接收文件</li>
             <li>支持时可选择保存位置，边下载边保存</li>
-            <li>下载过程中请勿关闭此页面</li>
+            <li>下载和保存过程中请勿刷新、关闭此页面或在当前标签页跳转</li>
           </ul>
         </div>
       </Space>
@@ -915,7 +949,23 @@ onMounted(async () => {
 
 .file-details {
   flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
+
+.completion-header { text-align: center; padding: 12px 0 4px; }
+.completion-icon { display: inline-flex; padding: 16px; margin-bottom: 16px; border-radius: 50%; color: #239568; background: #eaf8f0; }
+.completion-details { padding: 20px; border: 1px solid #e5ebf7; border-radius: 14px; background: #f8faff; }
+.completion-row { display: flex; justify-content: space-between; gap: 16px; margin-bottom: 12px; font-size: 14px; }
+.completion-row span { color: #6b7280; }
+.completion-row strong { text-align: right; }
+.completion-details p { color: #6b7280; line-height: 1.7; margin: 16px 0; }
+.completion-actions { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 20px; }
+.finalizing-notice { display: flex; align-items: flex-start; gap: 12px; margin-top: 16px; padding: 16px; text-align: left; background: #edf3ff; border-radius: 12px; color: #4365a0; }
+.finalizing-notice p { margin: 6px 0 0; line-height: 1.7; font-size: 13px; }
+.saving-spinner { flex-shrink: 0; margin-top: 2px; animation: saving-spin 1.2s linear infinite; }
+@keyframes saving-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .saving-spinner { animation: none; } }
 
 .file-details :deep(.ant-typography) {
   display: block;
