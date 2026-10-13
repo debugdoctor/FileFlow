@@ -10,9 +10,15 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Set up pnpm
+        run: npm install --global pnpm@9.15.9
       - name: Make all
         run: |
-          ./package.sh
+          ./package.sh "${GITHUB_REF_NAME}"
       - name: Release
         uses: softprops/action-gh-release@v2
         if: github.ref_type == 'tag'

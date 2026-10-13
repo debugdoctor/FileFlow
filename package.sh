@@ -70,7 +70,7 @@ check_pnpm() {
 # Function to install pnpm
 install_pnpm() {
     echo "Installing pnpm..."
-    npm install -g pnpm
+    npm install -g pnpm@9.15.9
     
     if command -v pnpm >/dev/null 2>&1; then
         PNPM_VERSION=$(pnpm --version)
@@ -184,7 +184,7 @@ mkdir -p "${BUILD_DIR}"
 # Build frontend first
 echo "Building frontend..."
 cd web
-pnpm install
+pnpm install --frozen-lockfile
 pnpm build-only
 cd ..
 
@@ -199,7 +199,7 @@ package_for_platform() {
     # Use cross for cross-compilation
     cd server
     rustup target add "${target}" 2>/dev/null || true
-    cargo build --release --target "${target}"
+    cargo build --release --locked --target "${target}"
     cd ..
     
     # Copy binary directly to build directory with platform-specific name
