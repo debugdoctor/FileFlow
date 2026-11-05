@@ -5,6 +5,7 @@ import { Download, FileText, HardDrive, Files, Square, CheckCircle2, LoaderCircl
 import { downloadFile, acknowledgeBlock, fetchJsonWithRetry, fetchWithRetry } from '@/utils/requests';
 import { processDownloadWithConcurrencyLimit } from '@/utils/asyncPool';
 import { DownloadSink, FileSaveError, type FileWriter } from '@/utils/downloadSink';
+import { isMobileDownloadClient } from '@/utils/downloadCapability';
 import { useTransferRate, formatRate } from '@/utils/useTransferRate';
 import { cancelTransfer, PeerCancelledError, watchTransfer } from '@/utils/transferControl';
 
@@ -46,7 +47,13 @@ let sink: DownloadSink | null = null;
 const receivedLength = ref(0);
 const speed = useTransferRate(() => receivedLength.value);
 const savePicker = (window as Window & { showSaveFilePicker?: (options: { suggestedName: string }) => Promise<{ createWritable(): Promise<FileWriter> }> }).showSaveFilePicker;
-const canStream = window.isSecureContext && typeof savePicker === 'function';
+const navigatorWithUserAgentData = navigator as Navigator & { userAgentData?: { mobile?: boolean } };
+const isMobileClient = isMobileDownloadClient(
+  navigator.userAgent,
+  navigator.maxTouchPoints,
+  navigatorWithUserAgentData.userAgentData?.mobile,
+);
+const canStream = !isMobileClient && window.isSecureContext && typeof savePicker === 'function';
 const saveMode = ref<'stream' | 'memory'>(canStream ? 'stream' : 'memory');
 const pendingAcks = new Set<number>();
 
@@ -490,8 +497,15 @@ const handleGetFile = async () => {
     if (!sink) {
       if (saveMode.value === 'stream' && savePicker) {
         // Must run directly inside the click gesture, before any network await.
-        const handle = await savePicker.call(window, { suggestedName: fileName.value || 'downloaded_file' });
-        sink = new DownloadSink(await handle.createWritable());
+        try {
+          const handle = await savePicker.call(window, { suggestedName: fileName.value || 'downloaded_file' });
+          sink = new DownloadSink(await handle.createWritable());
+        } catch (error) {
+          if (error instanceof DOMException && error.name === 'AbortError') throw error;
+          saveMode.value = 'memory';
+          sink = new DownloadSink();
+          message.warning('无法打开保存位置，已改用浏览器默认下载');
+        }
       } else sink = new DownloadSink();
     }
     controller.signal.throwIfAborted();
