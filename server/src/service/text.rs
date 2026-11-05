@@ -217,7 +217,11 @@ fn respond<T: Serialize>(result: Result<T, Failure>) -> axum::response::Response
 
 pub async fn page() -> axum::response::Response {
     match StaticFiles::get("text/index.html") {
-        Some(content) => Html(String::from_utf8_lossy(&content.data).into_owned()).into_response(),
+        Some(content) => {
+            let mut response = Html(String::from_utf8_lossy(&content.data).into_owned()).into_response();
+            response.headers_mut().insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
+            response
+        },
         None => (StatusCode::NOT_FOUND, "Page not found").into_response(),
     }
 }
@@ -256,6 +260,11 @@ mod tests {
     fn creator() -> String { "a".repeat(64) }
     fn guest() -> String { "b".repeat(64) }
     fn payload(id: usize, text: &str) -> SendPayload { SendPayload { id: format!("{id:032x}"), text: text.into() } }
+
+    #[tokio::test]
+    async fn page_disables_browser_caching() {
+        assert_eq!(page().await.headers()[header::CACHE_CONTROL], "no-store");
+    }
 
     #[test]
     fn bidirectional_history_and_retry_are_ordered_and_isolated() {

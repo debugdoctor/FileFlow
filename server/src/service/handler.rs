@@ -242,7 +242,9 @@ pub async fn home() -> impl IntoResponse {
     match StaticFiles::get("index.html") {
         Some(content) => {
             let html = String::from_utf8(content.data.to_vec()).unwrap();
-            Html(html).into_response()
+            let mut response = Html(html).into_response();
+            response.headers_mut().insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
+            response
         }
         None => {
             event!(Level::ERROR, "Landing page not found");
@@ -415,7 +417,9 @@ pub async fn upload() -> impl IntoResponse {
     match StaticFiles::get("upload/index.html") {
         Some(content) => {
             let html = String::from_utf8(content.data.to_vec()).unwrap();
-            Html(html).into_response()
+            let mut response = Html(html).into_response();
+            response.headers_mut().insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
+            response
         }
         None => {
             event!(Level::ERROR, "Upload page not found");
@@ -430,7 +434,9 @@ pub async fn download() -> impl IntoResponse {
     match StaticFiles::get("download/index.html") {
         Some(content) => {
             let html = String::from_utf8(content.data.to_vec()).unwrap();
-            Html(html).into_response()
+            let mut response = Html(html).into_response();
+            response.headers_mut().insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
+            response
         }
         None => {
             event!(Level::ERROR, "Download page not found");
@@ -1029,6 +1035,13 @@ pub async fn get_assets(Path(file): Path<String>) -> impl IntoResponse {
 mod tests {
     use super::*;
     use axum::body::{to_bytes, Bytes};
+
+    #[tokio::test]
+    async fn embedded_pages_disable_browser_caching() {
+        assert_eq!(home().await.into_response().headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(upload().await.into_response().headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(download().await.into_response().headers()[header::CACHE_CONTROL], "no-store");
+    }
 
     #[tokio::test]
     async fn downloaded_blocks_remain_retryable_until_done() {

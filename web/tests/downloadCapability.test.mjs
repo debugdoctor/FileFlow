@@ -12,6 +12,7 @@ const { isMobileDownloadClient } = await import(`data:text/javascript;base64,${B
 test('mobile browsers use the browser default download flow', () => {
   assert.equal(isMobileDownloadClient('Mozilla/5.0 (Linux; Android 15) AppleWebKit/537.36 Chrome/140 Mobile Safari/537.36'), true);
   assert.equal(isMobileDownloadClient('Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148'), true);
+  assert.equal(isMobileDownloadClient('Mozilla/5.0 (Linux; HarmonyOS) AppleWebKit/537.36 HuaweiBrowser/16.0 Safari/537.36'), true);
 });
 
 test('iPad desktop mode is still treated as mobile', () => {
@@ -21,4 +22,8 @@ test('iPad desktop mode is still treated as mobile', () => {
 test('user agent client hints take priority and desktop remains eligible', () => {
   assert.equal(isMobileDownloadClient('Mozilla/5.0 (X11; Linux x86_64) Chrome/140 Safari/537.36', 0, true), true);
   assert.equal(isMobileDownloadClient('Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/140 Safari/537.36', 0, false), false);
+});
+
+test('coarse pointer catches phones using a desktop user agent', () => {
+  assert.equal(isMobileDownloadClient('Mozilla/5.0 (X11; Linux x86_64) Chrome/140 Safari/537.36', 5, false, true), true);
 });

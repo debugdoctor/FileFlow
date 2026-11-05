@@ -52,6 +52,7 @@ const isMobileClient = isMobileDownloadClient(
   navigator.userAgent,
   navigator.maxTouchPoints,
   navigatorWithUserAgentData.userAgentData?.mobile,
+  typeof window.matchMedia === 'function' && window.matchMedia('(pointer: coarse)').matches,
 );
 const canStream = !isMobileClient && window.isSecureContext && typeof savePicker === 'function';
 const saveMode = ref<'stream' | 'memory'>(canStream ? 'stream' : 'memory');
@@ -497,24 +498,22 @@ const handleGetFile = async () => {
     if (!sink) {
       if (saveMode.value === 'stream' && savePicker) {
         // Must run directly inside the click gesture, before any network await.
-        try {
-          const handle = await savePicker.call(window, { suggestedName: fileName.value || 'downloaded_file' });
-          sink = new DownloadSink(await handle.createWritable());
-        } catch (error) {
-          if (error instanceof DOMException && error.name === 'AbortError') throw error;
-          saveMode.value = 'memory';
-          sink = new DownloadSink();
-          message.warning('无法打开保存位置，已改用浏览器默认下载');
-        }
+        const handle = await savePicker.call(window, { suggestedName: fileName.value || 'downloaded_file' });
+        sink = new DownloadSink(await handle.createWritable());
       } else sink = new DownloadSink();
     }
     controller.signal.throwIfAborted();
   } catch (error) {
     if (controller.signal.aborted) throw error;
-    isDownloading.value = false;
-    if (!(error instanceof DOMException && error.name === 'AbortError')) message.error('无法打开保存位置，请重试');
-    return;
+    if (error && typeof error === 'object' && 'name' in error && error.name === 'AbortError') {
+      isDownloading.value = false;
+      return;
+    }
+    saveMode.value = 'memory';
+    sink = new DownloadSink();
+    message.warning('无法打开保存位置，已改用浏览器默认下载');
   }
+  if (!sink) sink = new DownloadSink();
   const activeSink = sink;
   receivedLength.value = activeSink.bytes;
   speed.start();
