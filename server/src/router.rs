@@ -5,6 +5,7 @@ use tracing::{event, instrument, Level};
 use std::time::Duration;
 
 use crate::service::handler::{*};
+use crate::service::text;
 use tower_http::services::ServeDir;
 
 fn api_router() -> Router {
@@ -17,6 +18,12 @@ fn api_router() -> Router {
         .route("/id", get(get_id))
         .route("/config", get(get_transfer_config))
         .route("/p2p-config", get(get_p2p_config))
+        .route("/text/rooms", post(text::create).layer(DefaultBodyLimit::max(4096)))
+        .route("/text/rooms/{id}/join", post(text::join).layer(DefaultBodyLimit::max(4096)))
+        .route("/text/rooms/{id}", get(text::read))
+        .route("/text/rooms/{id}/messages", post(text::send).layer(DefaultBodyLimit::max(512 * 1024)))
+        .route("/text/rooms/{id}/close", post(text::close))
+        .route("/text/rooms/{id}/leave", post(text::leave))
         .route("/{id}/status", get(get_status))
         .route("/{id}/signal", get(get_signal).post(post_signal))
         // Add timeout layer specifically for upload api
@@ -42,6 +49,8 @@ fn view_router() -> Router {
         .route("/", get(home))
         .route("/upload", get(upload))
         .route("/download", get(download))
+        .route("/text", get(text::page))
+        .route("/text/", get(text::page))
         .route("/{id}/file", get(download))
 }
 

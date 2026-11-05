@@ -61,3 +61,6 @@ build/
 # Local environment files
 .env
 deploy/tls/
+
+# OpenCode local session state
+.opencode/
